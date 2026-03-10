@@ -125,13 +125,15 @@ class Quantizer(nn.Module):
                     importance_weights = importance_weights.unsqueeze(0)
                 if importance_weights.shape[-1] != x.shape[1]:
                     raise ValueError(
-                        "Quantizer.find_params(): `importance` must match the column count of the weight block being quantized."
+                        "Quantizer.find_params(): importance parameter shape mismatch. "
+                        f"Expected columns: {x.shape[1]}, got: {importance_weights.shape[-1]}."
                     )
                 if importance_weights.shape[0] == 1 and x.shape[0] != 1:
                     importance_weights = importance_weights.expand(x.shape[0], -1)
                 elif importance_weights.shape[0] != x.shape[0]:
                     raise ValueError(
-                        "Quantizer.find_params(): `importance` must have either one row or match the per-channel row count."
+                        "Quantizer.find_params(): importance parameter row count mismatch. "
+                        f"Expected 1 or {x.shape[0]} rows, got: {importance_weights.shape[0]}."
                     )
 
                 importance_mean = importance_weights.mean(dim=1, keepdim=True)
