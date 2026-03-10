@@ -4,7 +4,11 @@ from gptqmodel.quantization import QuantizeConfig
 from gptqmodel.quantization.quantizer import Quantizer
 
 
-def _weighted_sq_error(quantizer: Quantizer, weights: torch.Tensor, importance: torch.Tensor) -> torch.Tensor:
+def _calculate_weighted_squared_error(
+    quantizer: Quantizer,
+    weights: torch.Tensor,
+    importance: torch.Tensor,
+) -> torch.Tensor:
     dequant = quantizer.quantize(weights)
     return ((dequant - weights).pow(2) * importance.view(1, -1)).sum()
 
@@ -41,4 +45,12 @@ def test_activation_weighted_mse_prioritizes_salient_columns():
     weighted.find_params(weights, weight=True, importance=importance)
 
     assert not torch.allclose(weighted.scale, baseline.scale)
-    assert _weighted_sq_error(weighted, weights, importance) < _weighted_sq_error(baseline, weights, importance)
+    assert _calculate_weighted_squared_error(
+        weighted,
+        weights,
+        importance,
+    ) < _calculate_weighted_squared_error(
+        baseline,
+        weights,
+        importance,
+    )

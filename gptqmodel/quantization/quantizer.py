@@ -125,7 +125,7 @@ class Quantizer(nn.Module):
                     importance_weights = importance_weights.unsqueeze(0)
                 if importance_weights.shape[-1] != x.shape[1]:
                     raise ValueError(
-                        "Quantizer.find_params(): `importance` must match the flattened weight column count."
+                        "Quantizer.find_params(): `importance` must match the column count of the weight block being quantized."
                     )
                 if importance_weights.shape[0] == 1 and x.shape[0] != 1:
                     importance_weights = importance_weights.expand(x.shape[0], -1)
@@ -137,11 +137,8 @@ class Quantizer(nn.Module):
                 importance_mean = importance_weights.mean(dim=1, keepdim=True)
                 valid = torch.isfinite(importance_mean) & (importance_mean > 0)
                 if torch.any(valid):
-                    importance_weights = torch.where(
-                        valid,
-                        importance_weights / importance_mean.clamp_min(torch.finfo(x.dtype).eps),
-                        importance_weights,
-                    )
+                    normalized_weights = importance_weights / importance_mean.clamp_min(torch.finfo(x.dtype).eps)
+                    importance_weights = torch.where(valid, normalized_weights, torch.ones_like(importance_weights))
                 else:
                     importance_weights = None
 
