@@ -200,6 +200,49 @@ class SmoothMSE(SmoothMethod):
 
 
 @dataclass
+class SmoothAuto(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | try several smoothers, keep lowest MSE    |
+    | config         | SmoothAuto(...)                           |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | include_none   | keep unsmoothed baseline as candidate     |
+    | effect         | avoids regressions when smoothing hurts    |
+    +----------------+-------------------------------------------+
+    """
+
+    include_none: bool = True
+    mse_steps: int = 48
+    mse_maxshrink: float = 0.85
+    mad_k: float = 2.75
+    percentile: float = 99.5
+    low: float = 0.25
+    high: float = 99.75
+
+    def __init__(
+        self,
+        *,
+        include_none: bool = True,
+        mse_steps: int = 48,
+        mse_maxshrink: float = 0.85,
+        mad_k: float = 2.75,
+        percentile: float = 99.5,
+        low: float = 0.25,
+        high: float = 99.75,
+        group_size_threshold: int = 128,
+    ):
+        super().__init__(name="auto", group_size_threshold=group_size_threshold)
+        self.include_none = include_none
+        self.mse_steps = mse_steps
+        self.mse_maxshrink = mse_maxshrink
+        self.mad_k = mad_k
+        self.percentile = percentile
+        self.low = low
+        self.high = high
+
+
+@dataclass
 class SmoothOutlier(SmoothMethod):
     """
     +----------------+-------------------------------------------+
@@ -550,6 +593,17 @@ def _build_smooth_method_from_dict(payload: Dict[str, Any]) -> Optional[SmoothMe
         return SmoothMSE(
             steps=int(payload.get("steps", 32)),
             maxshrink=float(payload.get("maxshrink", 0.8)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "auto":
+        return SmoothAuto(
+            include_none=bool(payload.get("include_none", True)),
+            mse_steps=int(payload.get("mse_steps", 48)),
+            mse_maxshrink=float(payload.get("mse_maxshrink", 0.85)),
+            mad_k=float(payload.get("mad_k", 2.75)),
+            percentile=float(payload.get("percentile", 99.5)),
+            low=float(payload.get("low", 0.25)),
+            high=float(payload.get("high", 99.75)),
             group_size_threshold=group_size_threshold,
         )
     if method_type == "outlier":
@@ -1131,7 +1185,7 @@ class QuantizeConfig:
             failsafe = FailSafe(
                 strategy=FailSafeStrategy.RTN,
                 threshold="0.5%",
-                smooth=SmoothMSE(steps=32, maxshrink=0.9),
+                smooth=SmoothAuto(),
             )
 
         gptaq = kwargs.pop("gptaq", None)
@@ -1346,6 +1400,14 @@ class QuantizeConfig:
             elif isinstance(self.failsafe.smooth, SmoothMSE):
                 payload["steps"] = self.failsafe.smooth.steps
                 payload["maxshrink"] = self.failsafe.smooth.maxshrink
+            elif isinstance(self.failsafe.smooth, SmoothAuto):
+                payload["include_none"] = self.failsafe.smooth.include_none
+                payload["mse_steps"] = self.failsafe.smooth.mse_steps
+                payload["mse_maxshrink"] = self.failsafe.smooth.mse_maxshrink
+                payload["mad_k"] = self.failsafe.smooth.mad_k
+                payload["percentile"] = self.failsafe.smooth.percentile
+                payload["low"] = self.failsafe.smooth.low
+                payload["high"] = self.failsafe.smooth.high
             elif isinstance(self.failsafe.smooth, SmoothOutlier):
                 payload["pct"] = self.failsafe.smooth.pct
             elif isinstance(self.failsafe.smooth, SmoothSoftNorm):

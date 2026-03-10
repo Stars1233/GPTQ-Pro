@@ -16,8 +16,10 @@ from gptqmodel.quantization.config import (
     FailSafe,
     FailSafeStrategy,
     QuantizeConfig,
+    SmoothAuto,
     SmoothLog,
     SmoothMAD,
+    SmoothMSE,
     SmoothPercentile,
     SmoothPercentileAsymmetric,
 )
@@ -41,6 +43,50 @@ def test_smooth_mad_uses_sigma_normalized_window():
 
     clip_ratio = (clipped != block).float().mean().item()
     assert clip_ratio < 0.03, f"clip_ratio={clip_ratio:.4f} is too high for sigma-normalized MAD smoothing"
+
+
+def test_auto_smoother_matches_or_beats_single_smoothers():
+    torch.manual_seed(0)
+    weights = torch.randn(16, 128) * 0.2
+    weights[:, ::17] *= 9.0
+
+    auto = _failsafe_quantize(
+        weights,
+        128,
+        FailSafeStrategy.RTN,
+        smooth=SmoothAuto(
+            include_none=True,
+            mse_steps=36,
+            mse_maxshrink=0.9,
+            mad_k=2.75,
+            percentile=99.5,
+            low=0.25,
+            high=99.75,
+        ),
+    )
+    base = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN)
+    mse = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN, smooth=SmoothMSE(steps=36, maxshrink=0.9))
+    mad = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN, smooth=SmoothMAD(k=2.75))
+    asym = _failsafe_quantize(
+        weights,
+        128,
+        FailSafeStrategy.RTN,
+        smooth=SmoothPercentileAsymmetric(low=0.25, high=99.75),
+    )
+    shrink = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN, smooth=SmoothPercentile(percentile=99.5))
+
+    auto_err = (weights - auto).pow(2).mean(dim=1)
+    base_err = (weights - base).pow(2).mean(dim=1)
+    mse_err = (weights - mse).pow(2).mean(dim=1)
+    mad_err = (weights - mad).pow(2).mean(dim=1)
+    asym_err = (weights - asym).pow(2).mean(dim=1)
+    shrink_err = (weights - shrink).pow(2).mean(dim=1)
+
+    assert torch.all(auto_err <= base_err + 1e-7)
+    assert torch.all(auto_err <= mse_err + 1e-7)
+    assert torch.all(auto_err <= mad_err + 1e-7)
+    assert torch.all(auto_err <= asym_err + 1e-7)
+    assert torch.all(auto_err <= shrink_err + 1e-7)
 
 
 class TestGPTQHessianSimilarity(unittest.TestCase):

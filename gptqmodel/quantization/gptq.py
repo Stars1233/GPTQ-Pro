@@ -21,7 +21,15 @@ from torch.nn.modules.conv import _ConvNd
 
 from ..looper.named_module import NamedModule
 from ..quantization import QuantizeConfig
-from ..quantization.config import FailSafeStrategy, SmoothMSE
+from ..quantization.config import (
+    FailSafe,
+    FailSafeStrategy,
+    SmoothAuto,
+    SmoothMAD,
+    SmoothMSE,
+    SmoothPercentile,
+    SmoothPercentileAsymmetric,
+)
 from ..utils.device import get_device
 from ..utils.logger import setup_logger
 from ..utils.torch import torch_sync
@@ -641,76 +649,26 @@ class GPTQ:
             end = min(start + effective_group_size, self.columns)
             block = W[:, start:end]
 
-            if isinstance(smooth_method, SmoothMSE):
-                dequant, scale, zero = mse_optimal_quant(
+            if isinstance(smooth_method, SmoothAuto):
+                dequant, scale, zero = self._failsafe_quantize_auto(
                     block,
-                    self.qcfg,
-                    maxq,
-                    steps=mse_steps,
-                    maxshrink=mse_maxshrink,
-                )
-            else:
-                block_mod, scale_factor = smooth_block(
-                    block,
-                    self.failsafe,
+                    strategy=strategy,
+                    maxq=maxq,
+                    sigma=sigma,
+                    smooth_method=smooth_method,
                     group_size=effective_group_size,
                 )
-                if strategy == FailSafeStrategy.MIDPOINT:
-                    w_min = block_mod.min(dim=1, keepdim=True).values
-                    w_max = block_mod.max(dim=1, keepdim=True).values
-                    mid = (w_max + w_min) / 2.0
-                    scale = torch.clamp((w_max - w_min) / maxq, min=1e-8)
-                    zero_mid = torch.full_like(scale, maxq / 2.0)
-                    q = torch.round((block_mod - mid) / scale + zero_mid)
-                    q = torch.clamp(q, 0, maxq)
-                    zero = torch.round(zero_mid - (mid / scale))
-                    zero = torch.clamp(zero, 0, maxq)
-                    dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.MEAN:
-                    mean = block_mod.mean(dim=1, keepdim=True)
-                    max_dev = torch.max((block_mod - mean).abs(), dim=1, keepdim=True).values
-                    max_dev = torch.clamp(max_dev, min=1e-8)
-                    scale = (2 * max_dev) / maxq
-                    zero_mid = torch.full_like(scale, maxq / 2.0)
-                    q = torch.round((block_mod - mean) / scale + zero_mid)
-                    q = torch.clamp(q, 0, maxq)
-                    zero = torch.round(zero_mid - (mean / scale))
-                    zero = torch.clamp(zero, 0, maxq)
-                    dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.MEDIAN:
-                    median = block_mod.median(dim=1, keepdim=True).values
-                    max_dev = torch.max((block_mod - median).abs(), dim=1, keepdim=True).values
-                    max_dev = torch.clamp(max_dev, min=1e-8)
-                    scale = (2 * max_dev) / maxq
-                    zero_mid = torch.full_like(scale, maxq / 2.0)
-                    q = torch.round((block_mod - median) / scale + zero_mid)
-                    q = torch.clamp(q, 0, maxq)
-                    zero = torch.round(zero_mid - (median / scale))
-                    zero = torch.clamp(zero, 0, maxq)
-                    dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.STDCLIP:
-                    mean = block_mod.mean(dim=1, keepdim=True)
-                    std = block_mod.std(dim=1, keepdim=True, unbiased=False)
-                    std = torch.clamp(std, min=1e-8)
-                    lo = mean - sigma * std
-                    hi = mean + sigma * std
-                    scale = torch.clamp((hi - lo) / maxq, min=1e-8)
-                    zero = torch.round(-lo / scale)
-                    zero = torch.clamp(zero, 0, maxq)
-                    q = torch.round(block_mod / scale + zero)
-                    q = torch.clamp(q, 0, maxq)
-                    dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.RTN:
-                    self.quantizer.find_params(block_mod, weight=True)
-                    dequant = self.quantizer.quantize(block_mod)
-                    scale = self.quantizer.scale
-                    zero = self.quantizer.zero
-                else:
-                    raise ValueError(f"Unsupported failsafe strategy: {strategy}")
-
-                if scale_factor is not None:
-                    scale = scale * scale_factor
-                    dequant = dequant * scale_factor
+            else:
+                dequant, scale, zero = self._failsafe_quantize_block(
+                    block,
+                    strategy=strategy,
+                    maxq=maxq,
+                    sigma=sigma,
+                    smooth_method=smooth_method,
+                    group_size=effective_group_size,
+                    mse_steps=mse_steps,
+                    mse_maxshrink=mse_maxshrink,
+                )
 
             Q[:, start:end] = dequant
 
@@ -753,6 +711,161 @@ class GPTQ:
 
         self.H = None
         return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples
+
+    def _failsafe_quantize_block(
+            self,
+            block: torch.Tensor,
+            *,
+            strategy: FailSafeStrategy,
+            maxq: int,
+            sigma: float,
+            smooth_method,
+            group_size: int,
+            mse_steps: int,
+            mse_maxshrink: float,
+    ):
+        if isinstance(smooth_method, SmoothMSE):
+            return mse_optimal_quant(
+                block,
+                self.qcfg,
+                maxq,
+                steps=mse_steps,
+                maxshrink=mse_maxshrink,
+            )
+
+        block_mod, scale_factor = smooth_block(
+            block,
+            FailSafe(smooth=smooth_method),
+            group_size=group_size,
+        )
+        if strategy == FailSafeStrategy.MIDPOINT:
+            w_min = block_mod.min(dim=1, keepdim=True).values
+            w_max = block_mod.max(dim=1, keepdim=True).values
+            mid = (w_max + w_min) / 2.0
+            scale = torch.clamp((w_max - w_min) / maxq, min=1e-8)
+            zero_mid = torch.full_like(scale, maxq / 2.0)
+            q = torch.round((block_mod - mid) / scale + zero_mid)
+            q = torch.clamp(q, 0, maxq)
+            zero = torch.round(zero_mid - (mid / scale))
+            zero = torch.clamp(zero, 0, maxq)
+            dequant = (q - zero) * scale
+        elif strategy == FailSafeStrategy.MEAN:
+            mean = block_mod.mean(dim=1, keepdim=True)
+            max_dev = torch.max((block_mod - mean).abs(), dim=1, keepdim=True).values
+            max_dev = torch.clamp(max_dev, min=1e-8)
+            scale = (2 * max_dev) / maxq
+            zero_mid = torch.full_like(scale, maxq / 2.0)
+            q = torch.round((block_mod - mean) / scale + zero_mid)
+            q = torch.clamp(q, 0, maxq)
+            zero = torch.round(zero_mid - (mean / scale))
+            zero = torch.clamp(zero, 0, maxq)
+            dequant = (q - zero) * scale
+        elif strategy == FailSafeStrategy.MEDIAN:
+            median = block_mod.median(dim=1, keepdim=True).values
+            max_dev = torch.max((block_mod - median).abs(), dim=1, keepdim=True).values
+            max_dev = torch.clamp(max_dev, min=1e-8)
+            scale = (2 * max_dev) / maxq
+            zero_mid = torch.full_like(scale, maxq / 2.0)
+            q = torch.round((block_mod - median) / scale + zero_mid)
+            q = torch.clamp(q, 0, maxq)
+            zero = torch.round(zero_mid - (median / scale))
+            zero = torch.clamp(zero, 0, maxq)
+            dequant = (q - zero) * scale
+        elif strategy == FailSafeStrategy.STDCLIP:
+            mean = block_mod.mean(dim=1, keepdim=True)
+            std = block_mod.std(dim=1, keepdim=True, unbiased=False)
+            std = torch.clamp(std, min=1e-8)
+            lo = mean - sigma * std
+            hi = mean + sigma * std
+            scale = torch.clamp((hi - lo) / maxq, min=1e-8)
+            zero = torch.round(-lo / scale)
+            zero = torch.clamp(zero, 0, maxq)
+            q = torch.round(block_mod / scale + zero)
+            q = torch.clamp(q, 0, maxq)
+            dequant = (q - zero) * scale
+        elif strategy == FailSafeStrategy.RTN:
+            self.quantizer.find_params(block_mod, weight=True)
+            dequant = self.quantizer.quantize(block_mod)
+            scale = self.quantizer.scale
+            zero = self.quantizer.zero
+        else:
+            raise ValueError(f"Unsupported failsafe strategy: {strategy}")
+
+        if scale_factor is not None:
+            scale = scale * scale_factor
+            dequant = dequant * scale_factor
+        return dequant, scale, zero
+
+    def _failsafe_quantize_auto(
+            self,
+            block: torch.Tensor,
+            *,
+            strategy: FailSafeStrategy,
+            maxq: int,
+            sigma: float,
+            smooth_method: SmoothAuto,
+            group_size: int,
+    ):
+        candidates = []
+        if smooth_method.include_none:
+            candidates.append(None)
+        candidates.extend(
+            [
+                SmoothMSE(
+                    steps=smooth_method.mse_steps,
+                    maxshrink=smooth_method.mse_maxshrink,
+                    group_size_threshold=smooth_method.group_size_threshold,
+                ),
+                SmoothMAD(k=smooth_method.mad_k, group_size_threshold=smooth_method.group_size_threshold),
+                SmoothPercentile(
+                    percentile=smooth_method.percentile,
+                    group_size_threshold=smooth_method.group_size_threshold,
+                ),
+                SmoothPercentileAsymmetric(
+                    low=smooth_method.low,
+                    high=smooth_method.high,
+                    group_size_threshold=smooth_method.group_size_threshold,
+                ),
+            ]
+        )
+
+        best_dequant = None
+        best_scale = None
+        best_zero = None
+        best_err = None
+        block_ref = block.float()
+
+        for candidate in candidates:
+            candidate_steps = smooth_method.mse_steps if isinstance(candidate, SmoothMSE) else 32
+            candidate_shrink = smooth_method.mse_maxshrink if isinstance(candidate, SmoothMSE) else 0.8
+            dequant, scale, zero = self._failsafe_quantize_block(
+                block,
+                strategy=strategy,
+                maxq=maxq,
+                sigma=sigma,
+                smooth_method=candidate,
+                group_size=group_size,
+                mse_steps=candidate_steps,
+                mse_maxshrink=candidate_shrink,
+            )
+            err = (dequant.float() - block_ref).pow(2).mean(dim=1, keepdim=True)
+            if best_err is None:
+                best_dequant = dequant
+                best_scale = scale
+                best_zero = zero
+                best_err = err
+                continue
+
+            replace = err < best_err
+            best_err = torch.where(replace, err, best_err)
+            best_dequant = torch.where(replace, dequant, best_dequant)
+
+            scale_replace = replace if scale.dim() > 1 else replace.squeeze(1)
+            zero_replace = replace if zero.dim() > 1 else replace.squeeze(1)
+            best_scale = torch.where(scale_replace, scale, best_scale)
+            best_zero = torch.where(zero_replace, zero, best_zero)
+
+        return best_dequant, best_scale, best_zero
 
     # FIXME, optimum needs fasterquant, we need to remove it
     def fasterquant(

@@ -16,6 +16,7 @@ from .config import (
                      GPTAQConfig,
                      HessianConfig,
                      QuantizeConfig,
+                     SmoothAuto,
                      SmoothLog,
                      SmoothMAD,
                      SmoothMethod,

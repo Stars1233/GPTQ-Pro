@@ -434,6 +434,7 @@ If your goal is "better GPTQ quality without touching the inference kernels", th
 * GAR / `act_group_aware=True` to improve activation ordering without inference-time penalties.
 * MSE-based scale search (`mse > 0`) to reduce outlier-driven grid distortion.
 * Adaptive damping for badly conditioned Hessian blocks.
+* Best-of failsafe smoothing that tries several kernel-compatible offline preconditioning candidates and keeps the lowest-error result for under-sampled modules.
 * Optional GPTAQ experimentation, with the same GPTQ export format, when you want to test more aggressive offline correction.
 
 This is exposed as a convenience preset:
@@ -444,7 +445,7 @@ from gptqmodel.quantization import QuantizeConfig
 quant_config = QuantizeConfig.gptq_pro()
 ```
 
-`QuantizeConfig.gptq_pro()` is intentionally conservative: it keeps `quant_method=METHOD.GPTQ` and `format=FORMAT.GPTQ`, so inference speed comes from the same kernels as regular GPTQ. It does **not** claim that GPTQModel currently implements AWQ-style layer fusion or AutoRound-style learned rounding inside the GPTQ inner loop; those are separate algorithms and should be treated as separate offline quantizers.
+`QuantizeConfig.gptq_pro()` is intentionally conservative: it keeps `quant_method=METHOD.GPTQ` and `format=FORMAT.GPTQ`, so inference speed comes from the same kernels as regular GPTQ. The new preset also stays offline-only: for low-sample fallback blocks it borrows an AutoRound-like idea by searching a few smoothing candidates and choosing the one with the lowest reconstruction MSE, but it still emits ordinary GPTQ weights/scales/zeros for the same inference kernels. It does **not** claim that GPTQModel currently implements AWQ-style layer fusion or AutoRound-style learned rounding inside the GPTQ inner loop; those are separate algorithms and should be treated as separate offline quantizers.
 
 
 ### Experimental Features
