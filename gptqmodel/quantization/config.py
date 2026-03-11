@@ -237,10 +237,14 @@ class SmoothAuto(SmoothMethod):
             raise ValueError("SmoothAuto: `mse_steps` must be > 0.")
         if not (0.0 < mse_maxshrink <= 1.0):
             raise ValueError("SmoothAuto: `mse_maxshrink` must satisfy 0 < value <= 1.")
-        if not (0.0 < percentile <= 100.0):
-            raise ValueError("SmoothAuto: `percentile` must satisfy 0 < value <= 100.")
-        if not (0.0 <= low < high <= 100.0):
-            raise ValueError("SmoothAuto: `low`/`high` must satisfy 0 <= low < high <= 100.")
+        if percentile <= 0.0 or percentile > 100.0:
+            raise ValueError("SmoothAuto: `percentile` must be > 0.0 and <= 100.0.")
+        if not (0.0 <= low <= 100.0):
+            raise ValueError("SmoothAuto: `low` must satisfy 0 <= value <= 100.")
+        if not (0.0 <= high <= 100.0):
+            raise ValueError("SmoothAuto: `high` must satisfy 0 <= value <= 100.")
+        if low >= high:
+            raise ValueError("SmoothAuto: `low` must be strictly less than `high`.")
         self.include_none = include_none
         self.mse_steps = mse_steps
         self.mse_maxshrink = mse_maxshrink

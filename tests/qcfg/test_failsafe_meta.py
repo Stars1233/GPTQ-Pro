@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-
 import pytest
 
 from gptqmodel.quantization.config import FailSafe, QuantizeConfig, SmoothAuto, SmoothMAD
@@ -99,10 +98,10 @@ def test_gptq_pro_defaults_to_auto_failsafe_search():
         ({"mse_maxshrink": 1.1}, "mse_maxshrink"),
         ({"percentile": 0.0}, "percentile"),
         ({"percentile": 101.0}, "percentile"),
-        ({"low": 25.0, "high": 25.0}, "low"),
-        ({"low": 80.0, "high": 20.0}, "low"),
+        ({"low": 25.0, "high": 25.0}, "strictly less"),
+        ({"low": 80.0, "high": 20.0}, "strictly less"),
         ({"low": -1.0, "high": 99.0}, "low"),
-        ({"low": 0.0, "high": 101.0}, "low"),
+        ({"low": 0.0, "high": 101.0}, "high"),
     ],
 )
 def test_smooth_auto_rejects_invalid_config(kwargs, match):

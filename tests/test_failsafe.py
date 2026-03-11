@@ -100,6 +100,12 @@ def test_row_replace_mask_handles_vector_and_matrix_targets():
 
     matrix_target = torch.ones((3, 1), dtype=torch.float32)
     vector_target = torch.ones((3,), dtype=torch.float32)
+    selected_values_matrix = torch.tensor([[1.0], [2.0], [3.0]])
+    selected_values_vector = torch.tensor([1.0, 2.0, 3.0])
+    fallback_values_matrix = torch.tensor([[9.0], [9.0], [9.0]])
+    fallback_values_vector = torch.tensor([9.0, 9.0, 9.0])
+    expected_matrix = torch.tensor([[1.0], [9.0], [3.0]])
+    expected_vector = torch.tensor([1.0, 9.0, 3.0])
 
     matrix_mask = _row_replace_mask(replace, matrix_target)
     vector_mask = _row_replace_mask(replace, vector_target)
@@ -107,11 +113,11 @@ def test_row_replace_mask_handles_vector_and_matrix_targets():
     assert matrix_mask.shape == matrix_target.shape
     assert vector_mask.shape == vector_target.shape
 
-    matrix_selected = torch.where(matrix_mask, torch.tensor([[1.0], [2.0], [3.0]]), torch.tensor([[9.0], [9.0], [9.0]]))
-    vector_selected = torch.where(vector_mask, torch.tensor([1.0, 2.0, 3.0]), torch.tensor([9.0, 9.0, 9.0]))
+    matrix_selected = torch.where(matrix_mask, selected_values_matrix, fallback_values_matrix)
+    vector_selected = torch.where(vector_mask, selected_values_vector, fallback_values_vector)
 
-    torch.testing.assert_close(matrix_selected, torch.tensor([[1.0], [9.0], [3.0]]))
-    torch.testing.assert_close(vector_selected, torch.tensor([1.0, 9.0, 3.0]))
+    torch.testing.assert_close(matrix_selected, expected_matrix)
+    torch.testing.assert_close(vector_selected, expected_vector)
 
 
 class TestGPTQHessianSimilarity(unittest.TestCase):
