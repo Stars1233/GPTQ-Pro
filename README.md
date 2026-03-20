@@ -466,6 +466,7 @@ Operational notes from this setup:
 
 * The source `Qwen/Qwen3.5-4B` checkpoint is multimodal, so on a 12 GB 3060 the baseline `vLLM` comparison needed text-only settings: `language_model_only=True`, `limit_mm_per_prompt={"image": 0, "video": 0}`, `skip_mm_profiling=True`, `enforce_eager=True`, and `max_model_len=256`.
 * For this quantized checkpoint and `vLLM` stack, `gptq_marlin` was the working backend and the original tokenizer path had to be reused when serving the quantized weights.
+* Native `transformers` Qwen3.5 text quantization currently needs `batch_size=1` in GPTQModel because multi-sample padded calibration batches can fail in the SDPA attention path.
 * `*` Perplexity is included only as a regression signal here, consistent with the note above; it was measured on `wikitext-2-raw-v1` with `n_ctx=256` and `n_batch=256`.
 
 

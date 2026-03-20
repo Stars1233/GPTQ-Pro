@@ -36,7 +36,12 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="ModelCloud/Llama-3.2-1B-Instruct-gptqmodel-4bit-vortex-v2.5", help="Model name.")
     parser.add_argument("--tokenizer", type=str, default=None, help="Optional tokenizer path. Defaults to --model.")
     parser.add_argument("--n_ctx", type=int, default=1024, help="Context size.")
-    parser.add_argument("--n_batch", type=int, default=1024, help="Batch size.")
+    parser.add_argument(
+        "--n_batch",
+        type=int,
+        default=1024,
+        help="Approximate token budget per forward pass used to batch multiple context windows.",
+    )
     parser.add_argument("--dataset_path", type=str, default="wikitext", help="Path to the dataset.")
     parser.add_argument("--dataset_name", type=str, default=None, help="Name of the dataset.")
     parser.add_argument("--split", type=str, default="test", help="Dataset split to use.")

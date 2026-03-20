@@ -15,6 +15,9 @@ class Qwen3_5QModel(LlamaQModel):
     """
 
     config_class = Qwen3_5TextConfig
+    # Transformers' Qwen3.5 SDPA path currently errors when calibration batches
+    # contain multiple padded samples, so quantization must stay single-sample.
+    support_batch_quantize = False
 
     layer_modules_strict = False
 

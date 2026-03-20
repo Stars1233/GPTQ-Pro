@@ -1282,13 +1282,20 @@ class GPTQ:
                 avg_loss = torch.sum(Losses).item() / self.nsamples
 
                 if math.isnan(avg_loss):
-                    print("Losses sum item:", torch.sum(Losses).item())
+                    loss_sum = torch.sum(Losses).item()
                     if failsafe_configured:
-                        log.info(f"Quantization: Failed due to `NaN` loss for `{self.name}`, use mock quantization retry for `{self.name}`")
-                        self.qcfg.mock_quantization = True
-                        return self.quantize(blocksize=blocksize)
-                    else:
-                        raise ValueError(f"Quantization: Failed due to `NaN` loss for `{self.name}`, please try increasing calibration data samples or enable failsafe=True")
+                        log.warn(
+                            f"Quantization: Module `{self.name}` -> Hessian path produced `NaN` loss (sum={loss_sum}); "
+                            f"retrying with `{resolved_strategy.value}` failsafe quantization instead of mock quantization."
+                        )
+                        del Losses
+                        del W
+                        del Q
+                        return self._failsafe_quantize(resolved_strategy, blocksize)
+                    raise ValueError(
+                        f"Quantization: Failed due to `NaN` loss for `{self.name}` (sum={loss_sum}), "
+                        "please try increasing calibration data samples or enable failsafe=True"
+                    )
             else:
                 if failsafe_configured:
                     log.warn(f"Quantization: Module `{self.name}` -> using fail safe mode. Please check if calibration data is sufficient.")
