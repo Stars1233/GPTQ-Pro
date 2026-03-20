@@ -222,25 +222,26 @@ __global__ void gptq_pro_gemm_kernel(
 
     // ---- Store FP16 results to C ----
     //
-    // For m16n8k16.row.col with FP32 accumulators, each lane owns 4 output
-    // elements for a given j tile:
-    //   rows = {2*tid4 + 0, 2*tid4 + 1, 2*tid4 + 8, 2*tid4 + 9}
-    //   col  = groupID
-    const int groupID = lane >> 2;
-    const int tid4    = lane & 3;
+    // For m16n8k16.row.col with FP32 accumulators, each lane owns a 2-row x
+    // 2-column output fragment within the current n8 tile:
+    //   rows = {lane >> 2, lane >> 2 + 8}
+    //   cols = {2 * (lane & 3), 2 * (lane & 3) + 1}
+    const int row_base = lane >> 2;
+    const int col_pair = 2 * (lane & 3);
     #pragma unroll
     for (int j = 0; j < GPTQ_PRO_J_TILES; ++j) {
-        const int n  = n_base + j * 8 + groupID;
-        const int m0 = m_base + 2 * tid4 + 0;
-        const int m1 = m_base + 2 * tid4 + 1;
-        const int m2 = m_base + 2 * tid4 + 8;
-        const int m3 = m_base + 2 * tid4 + 9;
+        const int m0 = m_base + row_base;
+        const int m1 = m_base + row_base + 8;
+        const int n0 = n_base + j * 8 + col_pair + 0;
+        const int n1 = n_base + j * 8 + col_pair + 1;
 
-        if (n < N) {
-            if (m0 < M) C[m0 * N + n] = __float2half_rn(RC[j][0]);
-            if (m1 < M) C[m1 * N + n] = __float2half_rn(RC[j][1]);
-            if (m2 < M) C[m2 * N + n] = __float2half_rn(RC[j][2]);
-            if (m3 < M) C[m3 * N + n] = __float2half_rn(RC[j][3]);
+        if (m0 < M) {
+            if (n0 < N) C[m0 * N + n0] = __float2half_rn(RC[j][0]);
+            if (n1 < N) C[m0 * N + n1] = __float2half_rn(RC[j][1]);
+        }
+        if (m1 < M) {
+            if (n0 < N) C[m1 * N + n0] = __float2half_rn(RC[j][2]);
+            if (n1 < N) C[m1 * N + n1] = __float2half_rn(RC[j][3]);
         }
     }
 }

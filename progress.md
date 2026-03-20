@@ -1023,8 +1023,12 @@ The approved structural fixes have now been applied to the standalone `gptq_pro`
 - The MMA path was switched from FP16 accumulation to FP32 accumulation (`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`).
 - The kernel accumulator storage was updated from `RC[J_TILES][2]` FP16-pair registers to `RC[J_TILES][4]` FP32 outputs.
 - The epilogue store contract was corrected so each lane writes its 4 owned output elements using the PTX fragment map (`groupID = lane >> 2`, `tid4 = lane & 3`).
+- The B-fragment contract was corrected to match the official PTX `m16n8k16.row.col` ownership for matrix B: each lane now owns one logical B column (`groupID = lane >> 2`) across rows `{2*tid4, 2*tid4+1, 2*tid4+8, 2*tid4+9}` rather than two columns from one row pair.
 - The standalone validation harness was upgraded to validate the FP32-accumulator MMA path instead of the old FP16-accumulator path.
-- The decode-only validator was tightened to check both halves of each decoded `half2`, not just one lane.
+- The decode-only validator was tightened to check all 4 decoded FP16 values from each lane-local packed INT4 word, not just a subset of halves.
+- The MMA-step validator now uses non-uniform, FP16-exact synthetic A and B tiles wired through the PTX-defined fragment ownership, so row/column transpositions fail immediately instead of slipping through a uniform-data smoke test.
+- The validator now checks CUDA runtime calls explicitly, which prevents false positives or garbage summaries when a selected GPU is unavailable or out of memory on a shared machine.
+- A repeatable helper script now exists at `scripts/run_gptq_pro_validate.sh`; it builds the standalone validator, targets GPU `2` by default, and falls back to GPU `3` when the primary 3060 is unavailable.
 - Misleading comments about a completed production pipeline and a magic-decode fast path were corrected so the scaffold is honest about what is implemented versus still placeholder.
 
 ### Validation Run
@@ -1032,9 +1036,12 @@ The approved structural fixes have now been applied to the standalone `gptq_pro`
 The updated scaffold was verified locally with:
 
 - `nvcc -arch=sm_80 -std=c++17 -c gptq_pro_kernel.cu -o /tmp/gptq_pro_kernel.o`
-- `nvcc -arch=sm_80 -std=c++17 gptq_pro_validate.cu -o /tmp/gptq_pro_validate_patched`
-- `/tmp/gptq_pro_validate_patched` → `64 / 64 checks passed`
+- `nvcc -arch=sm_80 -std=c++17 gptq_pro_validate.cu -o /tmp/gptq_pro_validate_phase2`
+- `CUDA_VISIBLE_DEVICES=3 /tmp/gptq_pro_validate_phase2` → `64 / 64 checks passed`
+- `scripts/run_gptq_pro_validate.sh` → builds and runs the same standalone validator successfully on the default RTX 3060 (`2`)
 - `python -m pytest tests/qcfg/test_failsafe_meta.py -q` → `14 passed`
+
+**Shared-machine note:** one intermediate retry on RTX 3060 index `2` returned `cudaMalloc(...): out of memory` during validator setup, but a later rerun via `scripts/run_gptq_pro_validate.sh` passed on the same board once contention cleared. In practice, both RTX 3060s (`2` and `3`) are now known-good validation targets for this standalone scaffold.
 
 ### Remaining Known Scope
 
@@ -1043,6 +1050,7 @@ This is still a **standalone scaffold**, not the full final kernel from Alpha's 
 - async global→shared staging in `gptq_pro_gemm_kernel` remains placeholder
 - Paro rotation metadata is still identity-only
 - the direct global-store epilogue is correct but not yet coalesced via a shared-memory transpose buffer
+- the PTX-correct B-fragment ownership is now documented and validated, but the future global-to-shared B packer still has to materialize that exact layout from real GPTQ-packed weights
 - the INT8 sibling kernel and benchmark suite remain future work
 
 ---
@@ -1050,7 +1058,7 @@ This is still a **standalone scaffold**, not the full final kernel from Alpha's 
 ## Verification Run (Post-Implementation)
 
 **Date:** 2026-03-20
-**Environment:** Python 3.13.11, PyTorch 2.10.0, CUDA 12.x, 2× RTX 3090 + 3× RTX 3060
+**Environment:** Python 3.13.11, PyTorch 2.10.0, CUDA 12.x, 3× RTX 3090 + 2× RTX 3060
 
 ### CUDA Kernel Build
 ```
@@ -1063,6 +1071,29 @@ VALIDATE BUILD OK
 
 ### Standalone Validator
 ```
+=== TODO 1: decode-only validation ===
+  32 / 32 lanes passed
+=== TODO 2: ks/j MMA step validation ===
+  32 / 32 lanes passed
+
+=== Overall: 64 / 64 checks passed ===
+```
+
+### RTX 3060 Validation Path
+```bash
+$ CUDA_VISIBLE_DEVICES=2 /tmp/gptq_pro_validate_phase2
+CUDA error at gptq_pro_validate.cu:265: out of memory
+
+$ CUDA_VISIBLE_DEVICES=3 /tmp/gptq_pro_validate_phase2
+=== TODO 1: decode-only validation ===
+  32 / 32 lanes passed
+=== TODO 2: ks/j MMA step validation ===
+  32 / 32 lanes passed
+
+=== Overall: 64 / 64 checks passed ===
+
+$ scripts/run_gptq_pro_validate.sh
+==> Selected GPU 2
 === TODO 1: decode-only validation ===
   32 / 32 lanes passed
 === TODO 2: ks/j MMA step validation ===

@@ -22,25 +22,39 @@
 #include <cmath>
 #include <cstring>
 
+#define CHECK_CUDA(expr)                                                         \
+    do {                                                                         \
+        cudaError_t _err = (expr);                                               \
+        if (_err != cudaSuccess) {                                               \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n",                         \
+                    __FILE__, __LINE__, cudaGetErrorString(_err));               \
+            return 1;                                                            \
+        }                                                                        \
+    } while (0)
+
 // ============================================================
 // TODO 1  — Decode-only scalar reference
 // ============================================================
 
-/// Scalar (lane-independent) decode of one INT4 nibble pair.
+/// Scalar (lane-independent) decode of one lane-local 4-nibble B fragment.
 /// Mirrors exactly what decode_bfrag_to_rb() does on-device, using only
 /// host-visible arithmetic so the result can be used as ground truth.
 ///
-/// @param w0          unsigned 4-bit integer [0, 15] for RB[0]
-/// @param w1          unsigned 4-bit integer [0, 15] for RB[1]
+/// @param w0          unsigned 4-bit integer [0, 15] for RB[0] low half
+/// @param w1          unsigned 4-bit integer [0, 15] for RB[0] high half
+/// @param w2          unsigned 4-bit integer [0, 15] for RB[1] low half
+/// @param w3          unsigned 4-bit integer [0, 15] for RB[1] high half
 /// @param scale_f     FP32 version of the per-group scale
 /// @param zp_f        FP32 version of the per-group zero-point
-/// @param out_rb0_f   [out] dequantized value that goes into RB[0]
-/// @param out_rb1_f   [out] dequantized value that goes into RB[1]
-inline void scalar_decode_nibble(uint32_t w0, uint32_t w1,
-                                  float scale_f, float zp_f,
-                                  float& out_rb0_f, float& out_rb1_f) {
-    out_rb0_f = scale_f * (static_cast<float>(w0) - zp_f);
-    out_rb1_f = scale_f * (static_cast<float>(w1) - zp_f);
+/// @param out_rb_f    [out] dequantized values in order {w0, w1, w2, w3}
+inline void scalar_decode_bfrag(uint32_t w0, uint32_t w1,
+                                uint32_t w2, uint32_t w3,
+                                float scale_f, float zp_f,
+                                float (&out_rb_f)[4]) {
+    out_rb_f[0] = scale_f * (static_cast<float>(w0) - zp_f);
+    out_rb_f[1] = scale_f * (static_cast<float>(w1) - zp_f);
+    out_rb_f[2] = scale_f * (static_cast<float>(w2) - zp_f);
+    out_rb_f[3] = scale_f * (static_cast<float>(w3) - zp_f);
 }
 
 // ---------------------------------------------------------------------------
@@ -50,16 +64,15 @@ inline void scalar_decode_nibble(uint32_t w0, uint32_t w1,
 //   1. Reads its packed INT4 data from a pre-filled Bfrag smem region.
 //   2. Calls fetch_bfrag_packed16() (the real ld.shared.u32 path).
 //   3. Calls decode_bfrag_to_rb() to obtain RB[0], RB[1].
-//   4. Compares against a pre-computed float reference stored in ref_rb0 and
-//      ref_rb1 (one float per lane, computed by scalar_decode_nibble on host).
-//   5. Sets result[lane] = 1 if both half2 lanes match within FP16 precision.
+//   4. Compares against a pre-computed float reference stored in ref_rb
+//      (4 floats per lane, computed by scalar_decode_bfrag on host).
+//   5. Sets result[lane] = 1 if all four decoded values match.
 // ---------------------------------------------------------------------------
 __global__ void validate_decode_kernel(
     const uint32_t* __restrict__ bfrag_smem_src,  // GPTQ_PRO_BFRAG_WORDS_PER_BUF words (global, will be copied to smem)
     float           scale_f,
     float           zp_f,
-    const float*    ref_rb0,   // [WARP_SIZE] ground-truth for RB[0] per lane
-    const float*    ref_rb1,   // [WARP_SIZE] ground-truth for RB[1] per lane
+    const float*    ref_rb,    // [WARP_SIZE * 4] ground-truth per lane
     int*            result)    // [WARP_SIZE] 1=pass, 0=fail
 {
     // One warp handles one tile at ks=0, j=0.
@@ -96,10 +109,10 @@ __global__ void validate_decode_kernel(
     // FP16 has ~1e-3 relative error; use 2 ULP tolerance in FP16 space.
     const float tol = 2.0f * __half2float(__float2half(1.0f)) * 1e-3f;
 
-    bool ok = (fabsf(got_rb0_lo - ref_rb0[lane]) <= tol + 1e-5f) &&
-              (fabsf(got_rb0_hi - ref_rb0[lane]) <= tol + 1e-5f) &&
-              (fabsf(got_rb1_lo - ref_rb1[lane]) <= tol + 1e-5f) &&
-              (fabsf(got_rb1_hi - ref_rb1[lane]) <= tol + 1e-5f);
+    bool ok = (fabsf(got_rb0_lo - ref_rb[lane * 4 + 0]) <= tol + 1e-5f) &&
+              (fabsf(got_rb0_hi - ref_rb[lane * 4 + 1]) <= tol + 1e-5f) &&
+              (fabsf(got_rb1_lo - ref_rb[lane * 4 + 2]) <= tol + 1e-5f) &&
+              (fabsf(got_rb1_hi - ref_rb[lane * 4 + 3]) <= tol + 1e-5f);
     result[lane] = ok ? 1 : 0;
 }
 
@@ -112,11 +125,14 @@ __global__ void validate_decode_kernel(
 /// Interprets A and B as FP16 inputs and accumulates into FP32, matching the
 /// hardware accumulation semantics of the tensor-core instruction.
 ///
-/// Thread p (0..31) owns:
-///   RA: A[(p>>2) + {0,8}][(p&3)*2 + {0,1}]  → a[0..3] (4 fp16 in 2 u32)
-///   RB: B[(p>>2)*2 + {0,1}][(p&3)*2 + {0,1}] → b[0..1] (4 fp16 in 2 u32 via
-///         half2 packing)
-///   RC[j][0..3]: output accumulator fragment (4 fp32 values per tile j)
+/// PTX fragment ownership for mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32:
+///   A: row = groupID for ai in {0,1,4,5}, else groupID + 8
+///      col = 2 * threadID + (i & 1) [+8 for i >= 4]
+///   B: row = 2 * threadID + (i & 1) [+8 for i >= 2]
+///      col = groupID
+///   C/D: row = groupID for ci in {0,1}, else groupID + 8
+///        col = 2 * threadID + (i & 1)
+/// where groupID = lane >> 2 and threadID = lane & 3.
 ///
 /// This scalar function operates on the unpacked FP32 equivalents; the caller
 /// is responsible for unpacking and repacking.
@@ -124,6 +140,25 @@ inline float fma_f32_from_f16_inputs_proxy(float a, float b, float c) {
     const half ha = __float2half(a);
     const half hb = __float2half(b);
     return c + __half2float(ha) * __half2float(hb);
+}
+
+inline float mma_ref_a_value(int m_row, int k_col) {
+    return 0.03125f * static_cast<float>(m_row + 1)
+         + 0.001953125f * static_cast<float>(k_col + 1);
+}
+
+inline float mma_ref_b_value(int k_row, int group_id) {
+    return 0.0625f * static_cast<float>(k_row + 1)
+         + 0.0078125f * static_cast<float>(group_id);
+}
+
+inline uint32_t pack_half2(float lo, float hi) {
+    Half2Reg reg;
+    const half hlo = __float2half(lo);
+    const half hhi = __float2half(hi);
+    memcpy(&reg.u16[0], &hlo, sizeof(uint16_t));
+    memcpy(&reg.u16[1], &hhi, sizeof(uint16_t));
+    return reg.u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,18 +213,24 @@ __global__ void validate_mma_step_kernel(
 // Host-side driver — fills test data, launches kernels, checks results
 // ============================================================
 
-/// Fill Bfrag shared-memory image with pseudo-random INT4 nibbles.
-/// packed_16 for lane `l` in tile (0,0) = (l & 0xF) | ((l+1 & 0xF) << 8).
+/// Fill Bfrag shared-memory image with deterministic lane-local INT4 payloads.
+/// packed_16 for lane `l` in tile (0,0) packs four distinct nibbles:
+///   bits [3:0]   = (4*l + 0) & 0xF
+///   bits [7:4]   = (4*l + 1) & 0xF
+///   bits [11:8]  = (4*l + 2) & 0xF
+///   bits [15:12] = (4*l + 3) & 0xF
 static void fill_bfrag_test_image(uint32_t* words) {
     for (int w = 0; w < GPTQ_PRO_BFRAG_WORDS_PER_BUF; ++w) {
         words[w] = 0u;
     }
     // Tile ks=0, j=0, buf=0 starts at word offset 0.
     for (int lane = 0; lane < GPTQ_PRO_WARP_SIZE; ++lane) {
-        uint32_t w0 = lane & 0xFu;
-        uint32_t w1 = (lane + 1u) & 0xFu;
-        // packed_16 = w0 | (w1 << 8) in the appropriate byte position.
-        uint16_t p16 = static_cast<uint16_t>(w0 | (w1 << 8));
+        uint32_t w0 = (4u * lane + 0u) & 0xFu;
+        uint32_t w1 = (4u * lane + 1u) & 0xFu;
+        uint32_t w2 = (4u * lane + 2u) & 0xFu;
+        uint32_t w3 = (4u * lane + 3u) & 0xFu;
+        uint16_t p16 = static_cast<uint16_t>(
+            w0 | (w1 << 4) | (w2 << 8) | (w3 << 12));
         int word_idx = lane >> 1;   // lane pair
         if (lane & 1) {
             words[word_idx] = (words[word_idx] & 0x0000FFFFu)
@@ -218,110 +259,180 @@ int main() {
     fill_bfrag_test_image(h_bfrag);
 
     // Compute scalar reference for every lane.
-    float h_ref_rb0[GPTQ_PRO_WARP_SIZE];
-    float h_ref_rb1[GPTQ_PRO_WARP_SIZE];
+    float h_ref_rb[GPTQ_PRO_WARP_SIZE * 4];
     for (int lane = 0; lane < GPTQ_PRO_WARP_SIZE; ++lane) {
-        uint32_t w0 = lane & 0xFu;
-        uint32_t w1 = (lane + 1u) & 0xFu;
-        scalar_decode_nibble(w0, w1, scale_f, zp_f,
-                             h_ref_rb0[lane], h_ref_rb1[lane]);
+        uint32_t w0 = (4u * lane + 0u) & 0xFu;
+        uint32_t w1 = (4u * lane + 1u) & 0xFu;
+        uint32_t w2 = (4u * lane + 2u) & 0xFu;
+        uint32_t w3 = (4u * lane + 3u) & 0xFu;
+        float decoded[4];
+        scalar_decode_bfrag(w0, w1, w2, w3, scale_f, zp_f, decoded);
+        for (int i = 0; i < 4; ++i) {
+            h_ref_rb[lane * 4 + i] = decoded[i];
+        }
     }
 
     // Allocate device memory.
-    uint32_t* d_bfrag;    cudaMalloc(&d_bfrag,    bfrag_words * sizeof(uint32_t));
-    float*    d_ref_rb0;  cudaMalloc(&d_ref_rb0,  GPTQ_PRO_WARP_SIZE * sizeof(float));
-    float*    d_ref_rb1;  cudaMalloc(&d_ref_rb1,  GPTQ_PRO_WARP_SIZE * sizeof(float));
-    int*      d_result1;  cudaMalloc(&d_result1,  GPTQ_PRO_WARP_SIZE * sizeof(int));
+    uint32_t* d_bfrag;
+    float*    d_ref_rb;
+    int*      d_result1;
+    CHECK_CUDA(cudaMalloc(&d_bfrag,   bfrag_words * sizeof(uint32_t)));
+    CHECK_CUDA(cudaMalloc(&d_ref_rb,  GPTQ_PRO_WARP_SIZE * 4 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_result1, GPTQ_PRO_WARP_SIZE * sizeof(int)));
 
-    cudaMemcpy(d_bfrag,   h_bfrag,   bfrag_words * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ref_rb0, h_ref_rb0, GPTQ_PRO_WARP_SIZE * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ref_rb1, h_ref_rb1, GPTQ_PRO_WARP_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+    CHECK_CUDA(cudaMemcpy(
+        d_bfrag, h_bfrag, bfrag_words * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(
+        d_ref_rb, h_ref_rb, GPTQ_PRO_WARP_SIZE * 4 * sizeof(float),
+        cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(d_result1, 0, GPTQ_PRO_WARP_SIZE * sizeof(int)));
 
     size_t smem_bytes = GPTQ_PRO_BFRAG_WORDS_PER_BUF * sizeof(uint32_t);
     validate_decode_kernel<<<1, GPTQ_PRO_WARP_SIZE, smem_bytes>>>(
-        d_bfrag, scale_f, zp_f, d_ref_rb0, d_ref_rb1, d_result1);
-    cudaDeviceSynchronize();
+        d_bfrag, scale_f, zp_f, d_ref_rb, d_result1);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     int h_result1[GPTQ_PRO_WARP_SIZE];
-    cudaMemcpy(h_result1, d_result1, GPTQ_PRO_WARP_SIZE * sizeof(int), cudaMemcpyDeviceToHost);
+    CHECK_CUDA(cudaMemcpy(
+        h_result1, d_result1, GPTQ_PRO_WARP_SIZE * sizeof(int),
+        cudaMemcpyDeviceToHost));
 
     int pass1 = 0;
     for (int i = 0; i < GPTQ_PRO_WARP_SIZE; ++i) {
-        pass1 += h_result1[i];
-        if (!h_result1[i]) printf("  FAIL lane %d\n", i);
+        const bool ok = (h_result1[i] == 1);
+        pass1 += ok ? 1 : 0;
+        if (!ok) printf("  FAIL lane %d\n", i);
     }
     printf("  %d / %d lanes passed\n", pass1, GPTQ_PRO_WARP_SIZE);
 
-    cudaFree(d_bfrag); cudaFree(d_ref_rb0); cudaFree(d_ref_rb1); cudaFree(d_result1);
+    CHECK_CUDA(cudaFree(d_bfrag));
+    CHECK_CUDA(cudaFree(d_ref_rb));
+    CHECK_CUDA(cudaFree(d_result1));
 
     // -----------------------------------------------------------------------
     // TODO 2 — MMA step validation
     // -----------------------------------------------------------------------
     printf("=== TODO 2: ks/j MMA step validation ===\n");
 
-    // Build synthetic RA, RB fragments.
-    // All elements = a small FP16-representable constant so the scalar path
-    // and the hardware path agree exactly.
-    const float a_val = 0.5f;
-    const float b_val = 0.25f;
+    // Build synthetic RA, RB fragments from the PTX-defined fragment ownership.
+    // Both A and B vary with their logical coordinates, so row/column mix-ups in
+    // either fragment contract now perturb the final D fragment immediately.
+    float h_a_tile[GPTQ_PRO_M_PER_WARP][GPTQ_PRO_K_PER_WARP];
+    float h_b_tile[GPTQ_PRO_K_PER_WARP][8];
+    for (int m = 0; m < GPTQ_PRO_M_PER_WARP; ++m) {
+        for (int k = 0; k < GPTQ_PRO_K_PER_WARP; ++k) {
+            h_a_tile[m][k] = mma_ref_a_value(m, k);
+        }
+    }
+    for (int k = 0; k < GPTQ_PRO_K_PER_WARP; ++k) {
+        for (int n = 0; n < 8; ++n) {
+            h_b_tile[k][n] = mma_ref_b_value(k, n);
+        }
+    }
 
     uint32_t h_ra[GPTQ_PRO_WARP_SIZE * 4];
     uint32_t h_rb[GPTQ_PRO_WARP_SIZE * 2];
     for (int lane = 0; lane < GPTQ_PRO_WARP_SIZE; ++lane) {
-        half2 ah2 = __float2half2_rn(a_val);
-        half2 bh2 = __float2half2_rn(b_val);
-        uint32_t av, bv;
-        memcpy(&av, &ah2, 4);
-        memcpy(&bv, &bh2, 4);
-        h_ra[lane*4+0] = h_ra[lane*4+1] = h_ra[lane*4+2] = h_ra[lane*4+3] = av;
-        h_rb[lane*2+0] = h_rb[lane*2+1] = bv;
+        const int group_id = lane >> 2;
+        const int thread_id = lane & 3;
+        const int a_col_lo = 2 * thread_id;
+        const int a_col_hi = a_col_lo + 8;
+        const int row0 = 2 * thread_id + 0;
+        const int row1 = 2 * thread_id + 1;
+
+        h_ra[lane * 4 + 0] = pack_half2(
+            h_a_tile[group_id + 0][a_col_lo + 0],
+            h_a_tile[group_id + 0][a_col_lo + 1]);
+        h_ra[lane * 4 + 1] = pack_half2(
+            h_a_tile[group_id + 8][a_col_lo + 0],
+            h_a_tile[group_id + 8][a_col_lo + 1]);
+        h_ra[lane * 4 + 2] = pack_half2(
+            h_a_tile[group_id + 0][a_col_hi + 0],
+            h_a_tile[group_id + 0][a_col_hi + 1]);
+        h_ra[lane * 4 + 3] = pack_half2(
+            h_a_tile[group_id + 8][a_col_hi + 0],
+            h_a_tile[group_id + 8][a_col_hi + 1]);
+
+        h_rb[lane * 2 + 0] = pack_half2(
+            h_b_tile[row0 + 0][group_id],
+            h_b_tile[row1 + 0][group_id]);
+        h_rb[lane * 2 + 1] = pack_half2(
+            h_b_tile[row0 + 8][group_id],
+            h_b_tile[row1 + 8][group_id]);
     }
 
     // Scalar reference: each D[m][n] = sum_{k=0}^{15} A[m][k] * B[k][n].
-    // With uniform inputs, D[m][n] = 16 * a_val * b_val for all (m,n).
-    // In FP32 accumulation with FP16 inputs: simulate the 16-step chain in order.
-    // For m16n8k16, each thread's RA[0..3] contributes 8 A elements and RB[0..1]
-    // contributes 4 B elements; across 4 threads per output element, each
-    // thread contributes 4 of the 16 K multiplications.
-    // With uniform inputs every lane computes the same reference value.
+    // For m16n8k16.row.col.f32 the lane-local D fragment is a 2-row x 2-column
+    // tile, so compare against the full 16x8 GEMM reference rather than a
+    // collapsed per-column reduction.
+    //   rows = {lane >> 2, lane >> 2 + 8}
+    //   cols = {2 * (lane & 3), 2 * (lane & 3) + 1}
     float h_ref_rc[GPTQ_PRO_WARP_SIZE * 4];
     {
-        // Simulate k=16 FP32-precision accumulations with FP16-rounded inputs.
-        float acc = 0.0f;
-        for (int k = 0; k < 16; ++k) {
-            acc = fma_f32_from_f16_inputs_proxy(a_val, b_val, acc);
+        float h_d_tile[GPTQ_PRO_M_PER_WARP][8];
+        for (int m = 0; m < GPTQ_PRO_M_PER_WARP; ++m) {
+            for (int n = 0; n < 8; ++n) {
+                float acc = 0.0f;
+                for (int k = 0; k < GPTQ_PRO_K_PER_WARP; ++k) {
+                    acc = fma_f32_from_f16_inputs_proxy(
+                        h_a_tile[m][k], h_b_tile[k][n], acc);
+                }
+                h_d_tile[m][n] = acc;
+            }
         }
         for (int lane = 0; lane < GPTQ_PRO_WARP_SIZE; ++lane) {
-            for (int c = 0; c < 4; ++c) {
-                h_ref_rc[lane*4 + c] = acc;
-            }
+            const int row_base = lane >> 2;
+            const int col_base = 2 * (lane & 3);
+            h_ref_rc[lane * 4 + 0] = h_d_tile[row_base + 0][col_base + 0];
+            h_ref_rc[lane * 4 + 1] = h_d_tile[row_base + 0][col_base + 1];
+            h_ref_rc[lane * 4 + 2] = h_d_tile[row_base + 8][col_base + 0];
+            h_ref_rc[lane * 4 + 3] = h_d_tile[row_base + 8][col_base + 1];
         }
     }
 
-    uint32_t* d_ra;     cudaMalloc(&d_ra,    GPTQ_PRO_WARP_SIZE * 4 * sizeof(uint32_t));
-    uint32_t* d_rb;     cudaMalloc(&d_rb,    GPTQ_PRO_WARP_SIZE * 2 * sizeof(uint32_t));
-    float*    d_ref_rc; cudaMalloc(&d_ref_rc,GPTQ_PRO_WARP_SIZE * 4 * sizeof(float));
-    int*      d_result2;cudaMalloc(&d_result2,GPTQ_PRO_WARP_SIZE * sizeof(int));
+    uint32_t* d_ra;
+    uint32_t* d_rb;
+    float*    d_ref_rc;
+    int*      d_result2;
+    CHECK_CUDA(cudaMalloc(&d_ra,     GPTQ_PRO_WARP_SIZE * 4 * sizeof(uint32_t)));
+    CHECK_CUDA(cudaMalloc(&d_rb,     GPTQ_PRO_WARP_SIZE * 2 * sizeof(uint32_t)));
+    CHECK_CUDA(cudaMalloc(&d_ref_rc, GPTQ_PRO_WARP_SIZE * 4 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_result2, GPTQ_PRO_WARP_SIZE * sizeof(int)));
 
-    cudaMemcpy(d_ra,     h_ra,     GPTQ_PRO_WARP_SIZE * 4 * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_rb,     h_rb,     GPTQ_PRO_WARP_SIZE * 2 * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ref_rc, h_ref_rc, GPTQ_PRO_WARP_SIZE * 4 * sizeof(float),    cudaMemcpyHostToDevice);
+    CHECK_CUDA(cudaMemcpy(
+        d_ra, h_ra, GPTQ_PRO_WARP_SIZE * 4 * sizeof(uint32_t),
+        cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(
+        d_rb, h_rb, GPTQ_PRO_WARP_SIZE * 2 * sizeof(uint32_t),
+        cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(
+        d_ref_rc, h_ref_rc, GPTQ_PRO_WARP_SIZE * 4 * sizeof(float),
+        cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(d_result2, 0, GPTQ_PRO_WARP_SIZE * sizeof(int)));
 
     validate_mma_step_kernel<<<1, GPTQ_PRO_WARP_SIZE>>>(
         d_ra, d_rb, d_ref_rc, d_result2);
-    cudaDeviceSynchronize();
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     int h_result2[GPTQ_PRO_WARP_SIZE];
-    cudaMemcpy(h_result2, d_result2, GPTQ_PRO_WARP_SIZE * sizeof(int), cudaMemcpyDeviceToHost);
+    CHECK_CUDA(cudaMemcpy(
+        h_result2, d_result2, GPTQ_PRO_WARP_SIZE * sizeof(int),
+        cudaMemcpyDeviceToHost));
 
     int pass2 = 0;
     for (int i = 0; i < GPTQ_PRO_WARP_SIZE; ++i) {
-        pass2 += h_result2[i];
-        if (!h_result2[i]) printf("  FAIL lane %d\n", i);
+        const bool ok = (h_result2[i] == 1);
+        pass2 += ok ? 1 : 0;
+        if (!ok) printf("  FAIL lane %d\n", i);
     }
     printf("  %d / %d lanes passed\n", pass2, GPTQ_PRO_WARP_SIZE);
 
-    cudaFree(d_ra); cudaFree(d_rb); cudaFree(d_ref_rc); cudaFree(d_result2);
+    CHECK_CUDA(cudaFree(d_ra));
+    CHECK_CUDA(cudaFree(d_rb));
+    CHECK_CUDA(cudaFree(d_ref_rc));
+    CHECK_CUDA(cudaFree(d_result2));
 
     // -----------------------------------------------------------------------
     int total = pass1 + pass2;

@@ -18,12 +18,17 @@
  *   Each (ks, j) tile uses 16 uint32_t words (one word per lane-pair).
  *   Word index = lane >> 1 (4-byte aligned).
  *   Within a word:
- *     bits [15:0]  → two INT4 nibbles for even lane (2k):
- *                      bits [3:0]  = w0 nibble  (RB[0], low half)
- *                      bits [7:4]  = reserved in the current scaffold
- *                      bits [11:8] = w1 nibble  (RB[1], low half)
- *                      bits [15:12]= reserved in the current scaffold
+ *     bits [15:0]  → four INT4 nibbles for even lane (2k):
+ *                      bits [3:0]  = w0 nibble  (row=r0,   col=c)
+ *                      bits [7:4]  = w1 nibble  (row=r1,   col=c)
+ *                      bits [11:8] = w2 nibble  (row=r0+8, col=c)
+ *                      bits [15:12]= w3 nibble  (row=r1+8, col=c)
  *     bits [31:16] → same pattern for odd lane (2k+1)
+ *
+ *   For the m16n8k16.row.col B fragment, PTX defines:
+ *     c  = lane >> 2
+ *     r0 = 2 * (lane & 3)
+ *     r1 = r0 + 1
  */
 
 #pragma once
@@ -119,10 +124,10 @@ void st_shared_u32(uint32_t smem_addr, uint32_t val) {
 
 /// Fetch the packed 16-bit nibble word for this lane from tile (ks, j).
 /// Returns a uint16_t holding 4 nibbles:
-///   bits [3:0]   = weight nibble 0  (will become RB[0] low FP16)
-///   bits [7:4]   = reserved in the current scaffold
-///   bits [11:8]  = weight nibble 1  (will become RB[1] low FP16)
-///   bits [15:12] = reserved in the current scaffold
+///   bits [3:0]   = weight nibble 0  (row=r0,   col=c)
+///   bits [7:4]   = weight nibble 1  (row=r1,   col=c)
+///   bits [11:8]  = weight nibble 2  (row=r0+8, col=c)
+///   bits [15:12] = weight nibble 3  (row=r1+8, col=c)
 __device__ __forceinline__
 uint16_t fetch_bfrag_packed16(const uint32_t* __restrict__ smem_bfrag,
                               int buf, int ks, int j, int lane) {
@@ -136,9 +141,10 @@ uint16_t fetch_bfrag_packed16(const uint32_t* __restrict__ smem_bfrag,
 // INT4 nibble decode → FP16 (with scale & asymmetric offset)
 //
 // packed_16 layout (as produced by fetch_bfrag_packed16):
-//   bits [3:0]  → w0: INT4 weight for RB[0] half 0
-//   bits [11:8] → w1: INT4 weight for RB[1] half 0
-// (The high nibble in each byte is currently unused by the scaffold.)
+//   bits [3:0]   → w0: row=r0,   col=c → RB[0] low half
+//   bits [7:4]   → w1: row=r1,   col=c → RB[0] high half
+//   bits [11:8]  → w2: row=r0+8, col=c → RB[1] low half
+//   bits [15:12] → w3: row=r1+8, col=c → RB[1] high half
 //
 // Decode: fp16_w = scale * (nibble - zero_point)
 // The scaffold uses direct int→half conversion because the focus here is the
@@ -148,26 +154,31 @@ __device__ __forceinline__
 void decode_bfrag_to_rb(uint16_t packed_16,
                         half scale, half zero_point,
                         uint32_t (&RB)[2]) {
-    // Extract the two 4-bit weights (unsigned, range 0–15).
+    // Extract the four 4-bit weights (unsigned, range 0–15).
     const uint32_t p = static_cast<uint32_t>(packed_16);
-    const uint32_t w0 = (p >> 0) & 0xFu;
-    const uint32_t w1 = (p >> 8) & 0xFu;
+    const uint32_t w0 = (p >>  0) & 0xFu;
+    const uint32_t w1 = (p >>  4) & 0xFu;
+    const uint32_t w2 = (p >>  8) & 0xFu;
+    const uint32_t w3 = (p >> 12) & 0xFu;
 
     // Direct integer → half conversion (range 0–15, exact in FP16).
-    half2 vals = __halves2half2(__int2half_rn(static_cast<int>(w0)),
-                                __int2half_rn(static_cast<int>(w1)));
+    half2 vals01 = __halves2half2(__int2half_rn(static_cast<int>(w0)),
+                                  __int2half_rn(static_cast<int>(w1)));
+    half2 vals23 = __halves2half2(__int2half_rn(static_cast<int>(w2)),
+                                  __int2half_rn(static_cast<int>(w3)));
 
     // Apply asymmetric dequantization: result = scale * (w - zero_point).
     const half2 zp_h2 = __halves2half2(zero_point, zero_point);
     const half2 sc_h2 = __halves2half2(scale, scale);
-    half2 dq = __hmul2(sc_h2, __hsub2(vals, zp_h2));
+    half2 dq01 = __hmul2(sc_h2, __hsub2(vals01, zp_h2));
+    half2 dq23 = __hmul2(sc_h2, __hsub2(vals23, zp_h2));
 
     // Pack back into two uint32_t RB registers (each holds one FP16 pair).
-    // RB[0]: both halves of the n-column 0 (same weight, different k rows).
-    // RB[1]: both halves of the n-column 1.
+    // RB[0]: {w0, w1}
+    // RB[1]: {w2, w3}
     Half2Reg rb0, rb1;
-    rb0.h2 = __halves2half2(__low2half(dq), __low2half(dq));   // w0, w0
-    rb1.h2 = __halves2half2(__high2half(dq), __high2half(dq)); // w1, w1
+    rb0.h2 = dq01;
+    rb1.h2 = dq23;
     RB[0] = rb0.u32;
     RB[1] = rb1.u32;
 }
