@@ -534,6 +534,23 @@ validation, and this repository now exposes that scaffold as an **optional**
 `BACKEND.GPTQ_PRO` local runtime for explicit `GPTQModel.load(..., backend=BACKEND.GPTQ_PRO)`
 use on Ampere-class CUDA systems.
 
+For a local GPTQ-Pro export, the intended runtime entrypoint is:
+
+```python
+from gptqmodel import BACKEND, GPTQModel
+
+model = GPTQModel.load(
+    "/path/to/local-qwen35-gptq-pro",
+    device="cuda:0",
+    backend=BACKEND.GPTQ_PRO,
+    trust_remote_code=True,
+)
+```
+
+This explicit-only path was revalidated against a local `Qwen3.5-4B` GPTQ-Pro checkpoint:
+the loader selected `GptqProQuantLinear` modules end-to-end and completed a short generation
+smoke on CUDA.
+
 Current runtime limits are intentionally narrow: `4-bit`, symmetric GPTQ, `torch.float16`,
 and `desc_act=False` / sequential `g_idx` only. It derives a non-persistent byte-packed weight
 buffer during `post_init()` for the CUDA kernel, but it does **not** yet replace the larger
