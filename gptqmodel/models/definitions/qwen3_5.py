@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 from transformers import AutoModelForImageTextToText
+from transformers.models.qwen3_5 import Qwen3_5TextConfig
 
 from . import LlamaQModel
 
@@ -14,9 +15,13 @@ class Qwen3_5QModel(LlamaQModel):
     non-quantized so the layer walker captures the complete structure.
     """
 
+    config_class = Qwen3_5TextConfig
     loader = AutoModelForImageTextToText
-
     require_load_processor = True
+
+    # Transformers' Qwen3.5 SDPA path currently errors when calibration batches
+    # contain multiple padded samples, so quantization must stay single-sample.
+    support_batch_quantize = False
 
     layer_modules_strict = False
 

@@ -120,6 +120,38 @@ def test_row_replace_mask_handles_vector_and_matrix_targets():
     torch.testing.assert_close(vector_selected, expected_vector)
 
 
+def test_nan_loss_retries_with_failsafe_instead_of_enabling_mock_quantization(monkeypatch):
+    torch.manual_seed(0)
+
+    linear = nn.Linear(32, 16, bias=False)
+    qcfg = QuantizeConfig(
+        bits=4,
+        group_size=8,
+        desc_act=False,
+        act_group_aware=False,
+        failsafe={"strategy": "rtn", "threshold": True},
+    )
+    gptq = GPTQ(linear, qcfg)
+    gptq.quantizer.configure(perchannel=True)
+    gptq.add_batch(torch.randn(12, 32), None)
+
+    calls = {"count": 0}
+    original_quantize = gptq.quantizer.quantize
+
+    def quantize_with_single_nan(x):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return torch.full_like(x, float("nan"))
+        return original_quantize(x)
+
+    monkeypatch.setattr(gptq.quantizer, "quantize", quantize_with_single_nan)
+
+    _, _, _, _, _, avg_loss, _, _ = gptq.quantize(blocksize=8)
+
+    assert avg_loss.startswith("failsafe(rtn):")
+    assert gptq.qcfg.mock_quantization is False
+
+
 class TestGPTQHessianSimilarity(unittest.TestCase):
     """
     This test verifies that Hessian-based GPTQ produces quantized weights
