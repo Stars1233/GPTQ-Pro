@@ -16,15 +16,20 @@ from gptqmodel.quantization.config import (
     FailSafe,
     FailSafeStrategy,
     QuantizeConfig,
+    SmoothAuto,
     SmoothLog,
     SmoothMAD,
+    SmoothMSE,
     SmoothPercentile,
     SmoothPercentileAsymmetric,
 )
 from gptqmodel.quantization.failsafe_smooth import smooth_block
-from gptqmodel.quantization.gptq import GPTQ
+from gptqmodel.quantization.gptq import GPTQ, _row_replace_mask
 from gptqmodel.utils.failsafe import should_use_failsafe
 from gptqmodel.utils.pause_resume import PauseResumeController
+
+
+AUTO_SMOOTHER_TEST_TOLERANCE = 1e-7
 
 
 def test_smooth_mad_uses_sigma_normalized_window():
@@ -41,6 +46,110 @@ def test_smooth_mad_uses_sigma_normalized_window():
 
     clip_ratio = (clipped != block).float().mean().item()
     assert clip_ratio < 0.03, f"clip_ratio={clip_ratio:.4f} is too high for sigma-normalized MAD smoothing"
+
+
+def test_auto_smoother_matches_or_beats_single_smoothers():
+    torch.manual_seed(0)
+    weights = torch.randn(16, 128) * 0.2
+    weights[:, ::17] *= 9.0
+
+    auto = _failsafe_quantize(
+        weights,
+        128,
+        FailSafeStrategy.RTN,
+        smooth=SmoothAuto(
+            include_none=True,
+            mse_steps=36,
+            mse_maxshrink=0.9,
+            mad_k=2.75,
+            percentile=99.5,
+            low=0.25,
+            high=99.75,
+        ),
+    )
+    base = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN)
+    mse = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN, smooth=SmoothMSE(steps=36, maxshrink=0.9))
+    mad = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN, smooth=SmoothMAD(k=2.75))
+    asym = _failsafe_quantize(
+        weights,
+        128,
+        FailSafeStrategy.RTN,
+        smooth=SmoothPercentileAsymmetric(low=0.25, high=99.75),
+    )
+    shrink = _failsafe_quantize(weights, 128, FailSafeStrategy.RTN, smooth=SmoothPercentile(percentile=99.5))
+
+    auto_err = (weights - auto).pow(2).mean(dim=1)
+    base_err = (weights - base).pow(2).mean(dim=1)
+    mse_err = (weights - mse).pow(2).mean(dim=1)
+    mad_err = (weights - mad).pow(2).mean(dim=1)
+    asym_err = (weights - asym).pow(2).mean(dim=1)
+    shrink_err = (weights - shrink).pow(2).mean(dim=1)
+
+    for label, candidate_err in (
+        ("base", base_err),
+        ("mse", mse_err),
+        ("mad", mad_err),
+        ("asym", asym_err),
+        ("percentile", shrink_err),
+    ):
+        assert torch.all(auto_err <= candidate_err + AUTO_SMOOTHER_TEST_TOLERANCE), label
+
+
+def test_row_replace_mask_handles_vector_and_matrix_targets():
+    replace = torch.tensor([[True], [False], [True]])
+
+    matrix_target = torch.ones((3, 1), dtype=torch.float32)
+    vector_target = torch.ones((3,), dtype=torch.float32)
+    selected_values_matrix = torch.tensor([[1.0], [2.0], [3.0]])
+    selected_values_vector = torch.tensor([1.0, 2.0, 3.0])
+    fallback_values_matrix = torch.tensor([[9.0], [9.0], [9.0]])
+    fallback_values_vector = torch.tensor([9.0, 9.0, 9.0])
+    expected_matrix = torch.tensor([[1.0], [9.0], [3.0]])
+    expected_vector = torch.tensor([1.0, 9.0, 3.0])
+
+    matrix_mask = _row_replace_mask(replace, matrix_target)
+    vector_mask = _row_replace_mask(replace, vector_target)
+
+    assert matrix_mask.shape == matrix_target.shape
+    assert vector_mask.shape == vector_target.shape
+
+    matrix_selected = torch.where(matrix_mask, selected_values_matrix, fallback_values_matrix)
+    vector_selected = torch.where(vector_mask, selected_values_vector, fallback_values_vector)
+
+    torch.testing.assert_close(matrix_selected, expected_matrix)
+    torch.testing.assert_close(vector_selected, expected_vector)
+
+
+def test_nan_loss_retries_with_failsafe_instead_of_enabling_mock_quantization(monkeypatch):
+    torch.manual_seed(0)
+
+    linear = nn.Linear(32, 16, bias=False)
+    qcfg = QuantizeConfig(
+        bits=4,
+        group_size=8,
+        desc_act=False,
+        act_group_aware=False,
+        failsafe={"strategy": "rtn", "threshold": True},
+    )
+    gptq = GPTQ(linear, qcfg)
+    gptq.quantizer.configure(perchannel=True)
+    gptq.add_batch(torch.randn(12, 32), None)
+
+    calls = {"count": 0}
+    original_quantize = gptq.quantizer.quantize
+
+    def quantize_with_single_nan(x):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return torch.full_like(x, float("nan"))
+        return original_quantize(x)
+
+    monkeypatch.setattr(gptq.quantizer, "quantize", quantize_with_single_nan)
+
+    _, _, _, _, _, avg_loss, _, _ = gptq.quantize(blocksize=8)
+
+    assert avg_loss.startswith("failsafe(rtn):")
+    assert gptq.qcfg.mock_quantization is False
 
 
 class TestGPTQHessianSimilarity(unittest.TestCase):

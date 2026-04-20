@@ -8,8 +8,8 @@
 import torch
 import torch.nn as nn
 
-from ..quantization import QuantizeConfig
 from ..utils.logger import setup_logger
+from .config import BaseQuantizeConfig, _normalize_quant_bits, resolve_quant_format
 
 
 log = setup_logger()
@@ -28,7 +28,7 @@ def quantize(x, scale, zero, maxq, requires_groupwise_processing: bool):
 
 
 class Quantizer(nn.Module):
-    def __init__(self, qcfg: QuantizeConfig, shape=1, name: str=None):
+    def __init__(self, qcfg: BaseQuantizeConfig, shape=1, name: str=None):
         super(Quantizer, self).__init__()
 
         self.qcfg = qcfg
@@ -48,12 +48,14 @@ class Quantizer(nn.Module):
         grid=100,
         maxshrink=0.8,
         trits=False,
-        bits:int=4, # for hf compat
-        sym:bool=False, # for hf compat
+        bits: int | str | None = None, # for hf compat
+        sym: bool | None = None, # for hf compat
     ):
         if self.name == HF_OPTIMUM:
-            self.qcfg.bits = bits
-            self.qcfg.sym = sym
+            if bits is not None:
+                self.qcfg.bits = _normalize_quant_bits(bits, format_value=resolve_quant_format(self.qcfg.format, self.qcfg.method))
+            if sym is not None:
+                self.qcfg.sym = sym
 
         if self.requires_groupwise_processing():
             self.maxq = torch.tensor(2 ** (self.qcfg.bits - 1) - 1)
@@ -112,9 +114,10 @@ class Quantizer(nn.Module):
                 else:
                     self.zero = torch.round(-xmin / self.scale)
 
-        if self.qcfg.mse > 0.0:
+        mse = float(getattr(self.qcfg, "mse", 0.0) or 0.0)
+        if mse > 0.0:
             importance_weights = None
-            if self.qcfg.activation_weighted_mse and importance is not None:
+            if getattr(self.qcfg, "activation_weighted_mse", False) and importance is not None:
                 importance_weights = torch.nan_to_num(
                     importance.to(device=dev, dtype=x.dtype),
                     nan=0.0,
@@ -158,7 +161,7 @@ class Quantizer(nn.Module):
                 q = quantize(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq, self.requires_groupwise_processing())
                 q -= x
                 q.abs_()
-                q.pow_(self.qcfg.mse)
+                q.pow_(mse)
                 if importance_weights is not None:
                     q.mul_(importance_weights)
                 err = torch.sum(q, 1)
