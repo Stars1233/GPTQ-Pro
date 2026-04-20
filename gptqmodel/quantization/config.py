@@ -2634,6 +2634,73 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             f.write(json_str)
 
     @classmethod
+    def gptq_pro(
+        cls,
+        *,
+        bits: int = 4,
+        group_size: int = 128,
+        sym: bool = True,
+        mse: float = 2.0,
+        damp_percent: float = 0.05,
+        damp_auto_increment: float = 0.01,
+        gptaq_alpha: Optional[float] = None,
+        gptaq_device: Union[str, torch.device] = "auto",
+        failsafe: Optional[Union[Fallback, Dict[str, Any], str, int, float]] = None,
+        **kwargs,
+    ) -> "QuantizeConfig":
+        """
+        Build a speed-preserving GPTQ quality profile.
+
+        The returned config keeps the standard GPTQ output format so existing
+        GPTQ/Marlin/ExLlama/VLLM kernels continue to run unchanged, while
+        enabling offline-only quality improvements already implemented in
+        GPTQModel such as GAR (`act_group_aware`), MSE scale search, and
+        adaptive damping for badly conditioned Hessian blocks.
+        """
+        if "quant_method" in kwargs and kwargs["quant_method"] != METHOD.GPTQ:
+            raise ValueError("QuantizeConfig.gptq_pro() only supports `quant_method=METHOD.GPTQ`.")
+        if METHOD_FIELD_CODE in kwargs and kwargs[METHOD_FIELD_CODE] != METHOD.GPTQ:
+            raise ValueError("QuantizeConfig.gptq_pro() only supports `method=METHOD.GPTQ`.")
+
+        if "format" in kwargs and kwargs["format"] not in QUANT_METHOD_FORMAT_MAPPING[METHOD.GPTQ]:
+            raise ValueError("QuantizeConfig.gptq_pro() only supports GPTQ-compatible output formats.")
+
+        fallback = kwargs.pop("fallback", None)
+        if fallback is None and "failsafe" in kwargs:
+            fallback = kwargs.pop("failsafe")
+        if fallback is None:
+            fallback = failsafe
+
+        if failsafe is None:
+            fallback = Fallback(
+                strategy=FallbackStrategy.RTN,
+                threshold="0.5%",
+                smooth=SmoothMSE(steps=32, maxshrink=0.9),
+            )
+
+        gptaq = kwargs.pop("gptaq", None)
+        if gptaq is None and gptaq_alpha is not None:
+            gptaq = GPTAQConfig(alpha=gptaq_alpha, device=gptaq_device)
+
+        defaults = {
+            "bits": bits,
+            "group_size": group_size,
+            "sym": sym,
+            METHOD_FIELD_CODE: METHOD.GPTQ,
+            "format": FORMAT.GPTQ,
+            "desc_act": False,
+            "act_group_aware": True,
+            "mse": mse,
+            "activation_weighted_mse": True,
+            "damp_percent": damp_percent,
+            "damp_auto_increment": damp_auto_increment,
+            "fallback": fallback,
+            "gptaq": gptaq,
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
     def from_quant_config(cls, quantize_cfg, format: str = None):
         valid_formats = set(FORMAT)
         format_auto_inferred = False
@@ -2761,6 +2828,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             "offload_to_disk_path": "offload_to_disk_path",
             "pack_impl": "pack_impl",
             "mse": "mse",
+            "activation_weighted_mse": "activation_weighted_mse",
             "mock_quantization": "mock_quantization",
             "act_group_aware": "act_group_aware",
             "true_sequential": "true_sequential",
@@ -3016,6 +3084,7 @@ class GPTQConfig(PreProcessorConfig):
     act_group_aware: Optional[bool] = field(default=None)
     static_groups: bool = field(default=False)
     mse: float = field(default=0.0)
+    activation_weighted_mse: bool = field(default=False)
     gptaq: Optional[GPTAQConfig] = field(default=None)
     foem: Optional[FOEMConfig] = field(default=None)
     mock_quantization: bool = field(
@@ -3100,6 +3169,7 @@ class GPTQConfig(PreProcessorConfig):
             }
 
         meta_payload["mse"] = self.mse
+        meta_payload["activation_weighted_mse"] = self.activation_weighted_mse
         meta_payload["mock_quantization"] = self.mock_quantization
         meta_payload["act_group_aware"] = self.act_group_aware
         meta_payload["hessian"] = {

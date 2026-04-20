@@ -961,16 +961,22 @@ class GPTQ:
             W = self.module_copy.to(device=self.H.device)
             del self.module_copy
 
-        self.quantizer.find_params(W, weight=True)
-
         # H = self.H.to(device=self.H.device)
 
+        activation_importance = None
         if use_hessian:
             # Replace NaN/Inf in H before processing (can occur with some model architectures)
             self.H.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             dead = torch.diag(self.H) == 0
             self.H[dead, dead] = 1
             W[:, dead] = 0
+            if self.qcfg.activation_weighted_mse:
+                activation_importance = torch.diag(self.H).clamp_min(0).to(device=W.device, dtype=W.dtype)
+                importance_mean = activation_importance.mean()
+                if torch.isfinite(importance_mean) and importance_mean > 0:
+                    activation_importance = activation_importance / importance_mean
+                else:
+                    activation_importance = None
 
         # g_idx = []
         scale = []
@@ -983,7 +989,14 @@ class GPTQ:
             groups = []
             for i in range(0, self.columns, self.qcfg.group_size):
                 quantizer = copy.deepcopy(self.quantizer)
-                quantizer.find_params(W[:, i: (i + self.qcfg.group_size)], weight=True)
+                group_importance = None
+                if activation_importance is not None:
+                    group_importance = activation_importance[i: (i + self.qcfg.group_size)]
+                quantizer.find_params(
+                    W[:, i: (i + self.qcfg.group_size)],
+                    weight=True,
+                    importance=group_importance,
+                )
 
                 scale.append(quantizer.scale)
                 zero.append(quantizer.zero)
@@ -994,6 +1007,8 @@ class GPTQ:
             try:
                 W = W[:, perm]
                 self.H = self.H[perm][:, perm]
+                if activation_importance is not None:
+                    activation_importance = activation_importance[perm]
             except RuntimeError as exc:
                 if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
                     raise
@@ -1004,7 +1019,8 @@ class GPTQ:
                 perm = perm.to(device=cpu_device)
                 W = W.to(device=cpu_device)[:, perm]
                 self.H = self.H.to(device=cpu_device)[perm][:, perm]
-                self.quantizer.find_params(W, weight=True)
+                if activation_importance is not None:
+                    activation_importance = activation_importance.to(device=cpu_device)[perm]
             invperm = torch.argsort(perm)
 
         elif self.qcfg.act_group_aware and use_hessian:
@@ -1022,6 +1038,8 @@ class GPTQ:
             try:
                 W = W[:, final_perm]
                 self.H = self.H[final_perm][:, final_perm]
+                if activation_importance is not None:
+                    activation_importance = activation_importance[final_perm]
             except RuntimeError as exc:
                 if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
                     raise
@@ -1032,7 +1050,10 @@ class GPTQ:
                 final_perm = final_perm.to(device=cpu_device)
                 W = W.to(device=cpu_device)[:, final_perm]
                 self.H = self.H.to(device=cpu_device)[final_perm][:, final_perm]
-                self.quantizer.find_params(W, weight=True)
+                if activation_importance is not None:
+                    activation_importance = activation_importance.to(device=cpu_device)[final_perm]
+
+        self.quantizer.find_params(W, weight=True, importance=activation_importance)
 
         if use_hessian:
             try:
@@ -1048,7 +1069,9 @@ class GPTQ:
                 cpu_device = torch.device("cpu")
                 self.H = self.H.to(device=cpu_device)
                 W = W.to(device=cpu_device)
-                self.quantizer.find_params(W, weight=True)
+                if activation_importance is not None:
+                    activation_importance = activation_importance.to(device=cpu_device)
+                self.quantizer.find_params(W, weight=True, importance=activation_importance)
                 Hinv, damp = self.hessian_inverse(self.H)
         else:
             Hinv, damp = None, 0.0
@@ -1073,7 +1096,14 @@ class GPTQ:
                         for group_start in group_start_cols:
                             group_end = min(group_start + self.qcfg.group_size, self.columns)
                             if group_start < group_end:
-                                self.quantizer.find_params(W[:, group_start:group_end], weight=True)
+                                group_importance = None
+                                if activation_importance is not None:
+                                    group_importance = activation_importance[group_start:group_end]
+                                self.quantizer.find_params(
+                                    W[:, group_start:group_end],
+                                    weight=True,
+                                    importance=group_importance,
+                                )
                                 scale.append(self.quantizer.scale)
                                 zero.append(self.quantizer.zero)
                                 now_idx += 1
@@ -1182,7 +1212,16 @@ class GPTQ:
                     if self.qcfg.group_size != -1:
                         if not self.qcfg.static_groups:
                             if (i1 + i) % self.qcfg.group_size == 0:
-                                self.quantizer.find_params(W[:, (i1 + i) : (i1 + i + self.qcfg.group_size)], weight=True)
+                                group_start = i1 + i
+                                group_end = group_start + self.qcfg.group_size
+                                group_importance = None
+                                if activation_importance is not None:
+                                    group_importance = activation_importance[group_start:group_end]
+                                self.quantizer.find_params(
+                                    W[:, group_start:group_end],
+                                    weight=True,
+                                    importance=group_importance,
+                                )
 
                             if ((i1 + i) // self.qcfg.group_size) - now_idx == -1:
                                 scale.append(self.quantizer.scale)
