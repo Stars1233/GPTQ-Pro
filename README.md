@@ -224,7 +224,9 @@ Current internal benchmarks have only shown a clear resource-usage benefit for `
 * ✨ Native integration with HF [Transformers](https://github.com/huggingface/transformers), [Optimum](https://github.com/huggingface/optimum), and [Peft](https://github.com/huggingface/peft)
 * 🚀 [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) inference integration for quantized models with format = `FORMAT.[GPTQ/AWQ]`
 * ✨ GPTQ, AWQ, ParoQuant, QQQ, GGUF, FP8, EXL3, GPTAQ, and FOEM quantization support.
+* 🚀 Local inference backends via `GPTQModel.load(..., backend=BACKEND.<...>)`: `MARLIN`, `MACHETE`, `EXLLAMA_V2`, `TRITON`, `BITBLAS`, `TORCH`, `QQQ`, plus experimental `GPTQ_PRO` for Ampere symmetric INT4 checkpoints with `desc_act=False`.
 * ✨ Prism Bonsai `Q1_0_g128` GGUF checkpoints can be loaded for post-quantized inference through the normal `model_id_or_path` argument. GPT-QModel normalizes the GGUF artifact internally for HF Transformers via its native GGUF runtime, and does not support Prism Bonsai quantization or export.
+* ✨ `model.serve(host, port)` launches an OpenAI-compatible FastAPI server at `/v1/chat/completions`.
 * 🚀 Quantize MoE models with ease even with extreme routing activation bias via `Moe.Routing` and/or `FailSafe`.
 * 🚀 Data Parallelism for 80%+ quantization speed reduction with Multi-GPU.
 * 🚀 Optimized for Python >= 3.13t (free threading) with lock-free threading.
@@ -315,6 +317,33 @@ apt install python3-dev
 pip install -v .
 ```
 
+### Conda + Docker (reproducible GPTQ-Pro / vLLM environment)
+
+This repository now includes a top-level `environment.yml` and `Dockerfile` for a reproducible
+CUDA + conda + editable-install workflow that matches the GPTQ-Pro / vLLM experiments documented
+below.
+
+```bash
+# conda / local
+conda env create -f environment.yml
+conda activate gptq-pro-vllm
+pip install -v --no-build-isolation -e ".[vllm,eval,openai]"
+
+# docker
+docker build -t gptq-pro-vllm .
+docker run --gpus all -it --shm-size=16g \
+  -v "$PWD":/workspace/GPTQ-Pro \
+  gptq-pro-vllm
+```
+
+Notes:
+
+* The Docker image expects the NVIDIA Container Toolkit on the host.
+* The conda env is intentionally named `gptq-pro-vllm` so shell snippets, chat examples, and vLLM
+  commands all use the same environment name.
+* `environment.yml` keeps the base environment lightweight; the editable install with
+  `.[vllm,eval,openai]` layers in the project extras from `pyproject.toml`.
+
 ### Inference
 Three-line API to use `GPT-QModel` for GPTQ model inference:
 
@@ -347,6 +376,27 @@ Notes:
 * This is a runtime toggle. It does not change model weights or saved checkpoints.
 * It mainly affects some fused AWQ and ParoQuant CUDA/Triton kernels. Dense/dequantize fallback paths are mostly unaffected.
 * `1` is recommended for regression testing and quality-sensitive evaluation. `0` may be useful when chasing a small latency win and the quality tradeoff is acceptable.
+
+### Chat CLI frontend
+
+The lightweight CLI frontend lives under [`chat/`](chat/README.md). It now supports:
+
+* `--tokenizer_path` to reuse a source tokenizer with a quantized checkpoint
+* `--system_prompt` to override or disable the default chat system message
+* `--max_new_tokens` to cap reply length
+* `--trust_remote_code` for newer Hugging Face model families such as Qwen 3.5
+
+Example:
+
+```bash
+cd chat
+./run.sh \
+  --gpu_id 0 \
+  --model_path /models/Qwen3.5-4B-abliterated-GPTQ-Pro-4bit \
+  --tokenizer_path wangzhang/Qwen3.5-4B-abliterated \
+  --max_new_tokens 1024 \
+  --trust_remote_code
+```
 
 ### OpenAI API compatible endpoint
 ```py
@@ -642,6 +692,191 @@ Set the `act_group_aware` parameter to `True` and disable the default activation
 
 ```python
 quant_config = QuantizeConfig(bits=4, group_size=128, act_group_aware=True)
+```
+
+### GPTQ-Pro quality profile (offline-only, speed-preserving)
+
+If your goal is "better GPTQ quality without touching the inference kernels", the factual way to do that in GPT-QModel is to stay inside the standard GPTQ artifact format and spend the extra work entirely during calibration/quantization. That preserves the same packed INT weights, scales, and zero-points expected by the existing Ampere-friendly GPTQ runtimes while enabling higher-quality offline heuristics such as:
+
+* GAR / `act_group_aware=True` to improve activation ordering without inference-time penalties.
+* MSE-based scale search (`mse > 0`) to reduce outlier-driven grid distortion.
+* Adaptive damping for badly conditioned Hessian blocks.
+* Best-of failsafe smoothing that tries several kernel-compatible offline preconditioning candidates and keeps the lowest-error result for under-sampled modules.
+* Optional GPTAQ experimentation, with the same GPTQ export format, when you want to test more aggressive offline correction.
+
+This is exposed as a convenience preset:
+
+```python
+from gptqmodel.quantization import QuantizeConfig
+
+quant_config = QuantizeConfig.gptq_pro()
+```
+
+`QuantizeConfig.gptq_pro()` is intentionally conservative: it keeps `quant_method=METHOD.GPTQ` and `format=FORMAT.GPTQ`, so inference speed comes from the same kernels as regular GPTQ. The new preset also stays offline-only: for low-sample fallback blocks it borrows an AutoRound-like idea by searching a few smoothing candidates and choosing the one with the lowest reconstruction MSE, but it still emits ordinary GPTQ weights/scales/zeros for the same inference kernels. It does **not** claim that GPTQModel currently implements AWQ-style layer fusion or AutoRound-style learned rounding inside the GPTQ inner loop; those are separate algorithms and should be treated as separate offline quantizers.
+
+Migration note: `QuantizeConfig.gptq_pro()` previously used a single fixed `SmoothMSE(...)` failsafe configuration. It now defaults to `SmoothAuto()`, so quantized outputs can change slightly across upgrades even though the exported GPTQ format and inference kernels stay the same. If you need the older GPTQ-Pro behavior for reproducibility, pass the previous failsafe config explicitly.
+
+#### Reference run: `Qwen/Qwen3.5-4B` on one RTX 3060 (12 GB)
+
+As a concrete single-GPU reference point, we quantized `Qwen/Qwen3.5-4B` with `QuantizeConfig.gptq_pro(bits=4, group_size=128, offload_to_disk=True)` on one isolated RTX 3060 (12 GB) and compared the original and quantized checkpoints with `vLLM`.
+
+Quantization used 16 calibration samples and finished in `376.20s`, with an additional `2.54s` to save the checkpoint.
+
+| Variant | Checkpoint size | vLLM load time | Output tok/s | Avg request latency | Wikitext-2 raw PPL* |
+| --- | --- | --- | --- | --- | --- |
+| Original checkpoint | `8.8G` | `24.10s` | `16.19` | `1.98s` | `11.36` |
+| GPTQ-Pro 4-bit checkpoint | `3.0G` | `15.37s` | `52.64` | `0.61s` | `12.33` |
+
+That run delivered a `3.25x` throughput speedup, `69.24%` lower average request latency, and `1.57x` faster model load time, while increasing perplexity by `0.97` absolute (`1.085x` relative) on Wikitext-2 raw.
+
+Operational notes from this setup:
+
+* The source `Qwen/Qwen3.5-4B` checkpoint is multimodal, so on a 12 GB 3060 the baseline `vLLM` comparison needed text-only settings: `language_model_only=True`, `limit_mm_per_prompt={"image": 0, "video": 0}`, `skip_mm_profiling=True`, `enforce_eager=True`, and `max_model_len=256`.
+* For this quantized checkpoint and `vLLM` stack, `gptq_marlin` was the working backend and the original tokenizer path had to be reused when serving the quantized weights.
+* Native `transformers` Qwen3.5 text quantization currently needs `batch_size=1` in GPTQModel because multi-sample padded calibration batches can fail in the SDPA attention path.
+* `*` Perplexity is included only as a regression signal here, consistent with the note above; it was measured on `wikitext-2-raw-v1` with `n_ctx=256` and `n_batch=256`.
+
+#### Replication assets, CUDA scaffold files, and `wangzhang/Qwen3.5-4B-abliterated` follow-up
+
+If you want to reproduce the low-level GPTQ-Pro CUDA validation work from this repository state,
+the relevant standalone CUDA files are:
+
+* `gptqmodel_ext/gptq_pro/gptq_pro_kernel.cuh`
+* `gptqmodel_ext/gptq_pro/gptq_pro_kernel.cu`
+* `gptqmodel_ext/gptq_pro/gptq_pro_validate.cu`
+
+These are the files used for the standalone scaffold / validator flow. They now cover a
+functional single-warp `sm80` Tensor Core path with explicit A/B/S staging and end-to-end
+validation, and this repository now exposes that scaffold as an **optional**
+`BACKEND.GPTQ_PRO` local runtime for explicit `GPTQModel.load(..., backend=BACKEND.GPTQ_PRO)`
+use on Ampere-class CUDA systems.
+
+For a local GPTQ-Pro export, the intended runtime entrypoint is:
+
+```python
+from gptqmodel import BACKEND, GPTQModel
+
+model = GPTQModel.load(
+    "/path/to/local-qwen35-gptq-pro",
+    device="cuda:0",
+    backend=BACKEND.GPTQ_PRO,
+    trust_remote_code=True,
+)
+```
+
+This explicit-only path was revalidated against a local `Qwen3.5-4B` GPTQ-Pro checkpoint:
+the loader selected `GptqProQuantLinear` modules end-to-end and completed a short generation
+smoke on CUDA.
+
+Current runtime limits are intentionally narrow: `4-bit`, symmetric GPTQ, `torch.float16`,
+and `desc_act=False` / sequential `g_idx` only. It derives a non-persistent byte-packed weight
+buffer during `post_init()` for the CUDA kernel, but it does **not** yet replace the larger
+production paths (`Marlin`, `Machete`, `vLLM`) or implement the planned multi-warp
+`cp.async` / `ldmatrix` pipeline discussed in `Project.md` / `progress.md`.
+
+For the `wangzhang/Qwen3.5-4B-abliterated` text-only follow-up, the measured results were:
+
+| Variant | Quantization time | WikiText-2 raw PPL | vLLM status / speed |
+| --- | --- | --- | --- |
+| Original BF16 | n/a | `8.3116` | vanilla `vLLM 0.17.0` blocked by Qwen3.5 text config mismatch |
+| Plain GPTQ 4-bit g128 | `181.4s` | `8.6759` | vanilla `vLLM 0.17.0` blocked by the same config mismatch |
+| GPTQ-Pro 4-bit g128 | `324.9s` | `8.6314` | patched `vLLM` + `gptq_marlin`: `175.21-178.14 tok/s` on `1x 3090`, `194.20-206.53 tok/s` on `2x 3090` |
+
+Vanilla `vLLM 0.17.0` failed on the original, plain GPTQ, and GPTQ-Pro checkpoints before first
+token with the same `Qwen3_5TextConfig` vs `Qwen3_5Config` type mismatch. The detailed comparison
+is documented in [`docs/qwen35_vllm_comparison.md`](docs/qwen35_vllm_comparison.md).
+
+For local or Hugging Face `qwen3_5_text` checkpoints in this repository, use
+`scripts/serve_vllm_qwen35.py` instead of calling `vllm serve` directly. The
+wrapper applies the text-only `Qwen3.5` serving settings documented above,
+patches vLLM's renderer/model-registry startup so `Qwen3_5TextConfig`
+checkpoints stay on the causal-LM path, restores the hybrid/M-RoPE interfaces
+needed by Qwen3.5 text-only checkpoints, maps vLLM's startup-time NVML scan to
+the GPUs already selected via `CUDA_VISIBLE_DEVICES`, and installs a small
+`LD_PRELOAD` NVML shim so NCCL tensor-parallel startup can skip broken physical
+GPUs on shared hosts. It now auto-detects `qwen3_5_text` from either a local
+`config.json` or a Hub repo ID's `AutoConfig`.
+
+For the exact launch commands that match the working `vLLM + gptq_marlin` path,
+see [`docs/qwen35_vllm_launch.md`](docs/qwen35_vllm_launch.md).
+
+In the shared-host validation for
+`lukey03/Qwen3.5-9B-abliterated` -> GPTQ-Pro 4-bit g128, quantization took
+`415.2s`, the earlier `GPTQModel.generate()` path measured only `15.61 tok/s`
+on `1x GPU` and `10.44 tok/s` on `2x GPU`, and the corrected warmed vLLM +
+`gptq_marlin` path reached about `104.96 tok/s` on `1x 3090` and `154.26 tok/s`
+on `2x 3090` (with `--gpu-memory-utilization 0.4` on the 2-GPU shared-host
+run). First-request latency is much slower than steady-state throughput because
+`torch.compile` and CUDA-graph capture warm the model on first use.
+
+#### Important limitation: GGUF-only Qwen 3.5 35B-A3B repositories
+
+The repository `HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive` currently publishes
+**GGUF files only** and its model card explicitly says `GPTQ — coming soon`.
+
+That matters because GPTQModel and the current vLLM workflow in this repository expect a
+Transformers / Safetensors checkpoint for GPTQ-Pro quantization. A GGUF-only repo is therefore not
+directly quantizable by GPTQModel, even if the underlying base architecture is supported.
+
+If you want to reproduce the same architecture with GPTQ-Pro today, start from the upstream
+Transformers checkpoint `Qwen/Qwen3.5-35B-A3B`, then re-run the same quantization and evaluation
+workflow once a non-GGUF release of the HauhauCS fine-tune becomes available.
+
+#### Replacement run: `huihui-ai/Huihui-Qwen3.5-27B-abliterated`
+
+Because the exact HauhauCS repo is GGUF-only, the quantizable replacement run used
+`huihui-ai/Huihui-Qwen3.5-27B-abliterated`, which ships a full Transformers / Safetensors
+checkpoint and keeps the same Qwen 3.5 family.
+
+For this larger model, the original-model perplexity path had to be stabilized on a single
+RTX 3090 plus CPU offload because another user process was holding ~8 GiB on the second 3090.
+The resulting comparison uses a fixed regression slice rather than the full WikiText-2 sweep:
+`max_length=256`, `stride=256`, `max_windows=16`, `4096` scored tokens total.
+
+| Variant | Quantization time | WikiText-2 regression-slice PPL | Notes |
+| --- | --- | --- | --- |
+| Original BF16 | n/a | `11.6266` | single `3090` + CPU offload |
+| GPTQ-Pro 4-bit g32 | `2273.6s` | `12.0161` | `128` calibration samples, output size ~`18G` |
+
+This GPTQ-Pro run therefore added `+0.3895` PPL on the same 4,096-token slice. The absolute PPL is
+not directly comparable to the earlier 4B full-dataset numbers because the 27B run used much shorter
+context windows to stay within the shared-machine VRAM budget and still hit the torch fallback path
+for Qwen 3.5 linear attention.
+
+The saved quantization metadata for this run confirms the highest-quality settings used here:
+
+* `QuantizeConfig.gptq_pro(bits=4, group_size=32)`
+* `calibration_samples=128`
+* `vram_strategy=balanced`
+* `gc_mode=on_stage_end`
+* `auto_forward_data_parallel=false`
+* `wait_for_submodule_finalizers=true`
+* `moe.routing=ExpertsRoutingBypass(batch_size=2)`
+* `offload_to_disk=true`
+
+`vLLM 0.17.0` still did **not** deploy this replacement model cleanly in the tested environment. A
+one-shot offline `LLM.generate()` smoke test against the quantized checkpoint selected
+`gptq_marlin`, but then failed before generation with the same Qwen 3.5 config-family mismatch:
+`Qwen3_5TextConfig` vs `Qwen3_5Config`, this time through the multimodal renderer path.
+
+Useful repo-side tools for that workflow:
+
+```bash
+# regression-style perplexity
+python examples/benchmark/perplexity.py \
+  --model /path/to/quantized-model \
+  --tokenizer /path/to/source-model \
+  --is_quantized \
+  --trust_remote_code \
+  --backend marlin
+
+# task evaluation with vLLM
+python scripts/eval_model.py \
+  --model /path/to/quantized-model \
+  --tasks arc_challenge,mmlu_stem \
+  --backend marlin \
+  --use-vllm \
+  --trust-remote-code
 ```
 
 

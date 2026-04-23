@@ -48,6 +48,9 @@ def clone_gptq_config_for_module(
         qcfg_clone.bits = qcfg.dynamic_get(module_full_name, "bits", qcfg_clone.bits)
         qcfg_clone.sym = qcfg.dynamic_get(module_full_name, "sym", qcfg_clone.sym)
         qcfg_clone.mse = qcfg.dynamic_get(module_full_name, "mse", qcfg_clone.mse)
+        qcfg_clone.activation_weighted_mse = qcfg.dynamic_get(
+            module_full_name, "activation_weighted_mse", qcfg_clone.activation_weighted_mse
+        )
 
         qcfg_clone.group_size = qcfg.dynamic_get(module_full_name, "group_size", qcfg_clone.group_size)
         desc_act_override = qcfg.dynamic_get(module_full_name, "desc_act", None)

@@ -22,6 +22,8 @@ class BACKEND(str, Enum):
     GPTQ_MARLIN = "gptq_marlin"  # marlin reduce ops, fp32 by default; controlled by GPTQMODEL_MARLIN_USE_FP32
     GPTQ_BITBLAS = "gptq_bitblas"  # BitBLAS AOT-compiled GPTQ kernel
     GPTQ_TORCH_ATEN = "gptq_torch_aten"  # CPU int4pack ATen kernel folded into GPT-QModel
+    GPTQ_PRO = "gptq_pro"  # experimental Ampere-only local kernel path for symmetric GPTQ INT4
+    HF_KERNEL = "hf_kernel"  # Hugging Face GPTQ kernels-community path
 
     # QQQ kernels
     QQQ = "qqq"  # marlin-based qqq kernel
@@ -39,6 +41,7 @@ class BACKEND(str, Enum):
     AWQ_MACHETE = "awq_machete"
     AWQ_MARLIN = "awq_marlin"
     AWQ_EXLLAMA_V2 = "awq_exllama_v2"
+    HF_KERNEL_AWQ = "hf_kernel_awq"
 
     # ParoQuant kernels
     PAROQUANT_CUDA = "paroquant_cuda"
@@ -67,10 +70,13 @@ class BACKEND(str, Enum):
     TORCH_INT8 = "torch_int8"
     TORCH = "torch"
     TRITON = "triton"
+    EXLLAMA_V1 = "exllama_v1"
     EXLLAMA_V2 = "exllama_v2"
     EXLLAMA_V3 = "exllama_v3"
+    EXLLAMA_EORA = "exllama_eora"
     MACHETE = "machete"
     MARLIN = "marlin"
+    MARLIN_FP16 = "marlin_fp16"
     BITBLAS = "bitblas"
     GEMM = "gemm"
     GEMM_TRITON = "gemm_triton"
