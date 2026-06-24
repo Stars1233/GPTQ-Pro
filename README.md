@@ -40,8 +40,11 @@ GPTQ-Pro focuses on the parts that matter when you are actually quantizing and s
 
 - **GPTQ-Pro INT4 dequant GEMM path**
 - **FP32-accumulator GPTQ-Pro kernel work**
+- **GPTQ-Pro as the unconditional default kernel** — auto-selected at top priority (120) above Marlin/ExLlama wherever its device check passes
 - **Activation-weighted GPTQ-Pro scale search**
 - **Adaptive GPTQ-Pro smoothing / failsafe logic**
+- **Named quantization-recipe presets** — `fast_4bit`, `quality_4bit`, `max_quality_4bit`, and `experimental_3bit_rotation` (see [Quantization recipe presets](#quantization-recipe-presets))
+- **Qwen3.5-MoE support** — text-only and multimodal (vision tower kept unquantized), MTP passthrough preserved, plus a reusable end-to-end quant script
 - **Qwen3.5 quantization, smoke tests, benchmark notes, and vLLM workflows**
 - **Local inference wiring for GPTQ-Pro**
 - **Gemma 4 GPTQ package validation**
@@ -50,6 +53,7 @@ GPTQ-Pro focuses on the parts that matter when you are actually quantizing and s
 - **PTX fallback gencode for better forward compatibility**
 - **GPTQ-only quantization restrictions where mixed paths are unsafe**
 - **Validation harnesses and regression tests for the experimental path**
+- **transformers 5.12 hub compatibility**
 
 The intent is simple: make GPTQ-Pro more useful for people running serious local LLM infrastructure, not just clean-room benchmark demos.
 
@@ -100,3 +104,62 @@ source .venv/bin/activate
 
 pip install --upgrade pip wheel setuptools
 pip install -e .
+```
+
+> Recommended toolchain: Python 3.13+, PyTorch ≥ 2.8, CUDA 12.x. The build links CUDA
+> kernels for Ampere (`sm_80/86/87`) with a PTX fallback for newer cards. To match the
+> CUDA toolkit to your installed PyTorch, run `./sync_cuda_toolkit_with_torch.sh`.
+
+After install, verify the package imports and reports the GPTQ-Pro build:
+
+```bash
+python -c "import gptqmodel; print(gptqmodel.__version__)"
+```
+
+---
+
+## Quickstart
+
+```python
+from gptqmodel import GPTQModel, QuantizeConfig
+
+# Balanced 4-bit GPTQ-Pro recipe (GAR + MSE scale search + activation-weighted MSE).
+qcfg = QuantizeConfig.quality_4bit(group_size=128)
+
+model = GPTQModel.load("Qwen/Qwen2.5-0.5B-Instruct", qcfg)
+model.quantize(["the quick brown fox " * 40] * 16, batch_size=1)
+model.save("qwen2.5-0.5b-gptq-pro-4bit")
+```
+
+At load time, the GPTQ-Pro kernel is auto-selected at top priority (120) on supported
+Ampere+ GPUs — no flags required. The emitted checkpoint stays in **standard GPTQ format**,
+so it also runs unchanged under GPTQ / Marlin / ExLlama / vLLM kernels.
+
+### Quantization recipe presets
+
+These are *quantization-time* recipes (independent of the runtime inference kernel). Higher
+presets cost more time to quantize but improve accuracy; all emit standard GPTQ checkpoints:
+
+| Preset | Builder | What it adds |
+| --- | --- | --- |
+| Fast | `QuantizeConfig.fast_4bit()` | Base GPTQ defaults (group-aware reordering on; MSE search & GPTAQ off) |
+| Quality | `QuantizeConfig.quality_4bit()` | `gptq_pro()`: GAR + MSE scale search + activation-weighted MSE + adaptive damping |
+| Max quality | `QuantizeConfig.max_quality_4bit()` | `quality_4bit` plus GPTAQ activation-aware error feedback (GPTQv2) |
+| Experimental 3-bit | `QuantizeConfig.experimental_3bit_rotation()` | 3-bit `max_quality` + Hadamard incoherence rotation (gated to llama/qwen2) |
+
+### Qwen3.5-MoE quantization
+
+GPTQ-Pro supports Qwen3.5-MoE in both text-only and multimodal forms. The vision tower
+(`model.visual.*`) and MTP (`mtp.*`) modules are carried through unquantized; only the
+language-model decoder layers are quantized. A reusable end-to-end script is provided:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python scripts/quant_qwen3_5_moe.py \
+  --model <hf_id_or_local_path> --out out-4bit \
+  --calib image --nsample 16 --preset quality --offload-disk
+```
+
+Use `--offload-disk` and a single GPU for large (256-expert) MoE checkpoints on ≤24 GB
+cards — multi-GPU replicates each layer across cards during calibration and can OOM. See the
+script header and [`docs/qwen35_vllm_launch.md`](docs/qwen35_vllm_launch.md) for vLLM serving.
