@@ -41,6 +41,7 @@ and checkpoint compatibility.
 | Capability | What it provides |
 |---|---|
 | **Ampere V3 kernel** | Specialized small-batch decode, Tensor Core prefill, and a validated shape fallback |
+| **V4 scale-cache experiment** | Bit-exact register-cached scale overlay, documented negative result ([docs/KERNEL_V4_EXPERIMENT.md](docs/KERNEL_V4_EXPERIMENT.md)) |
 | **Quality-first recipes** | Group-aware reordering, MSE scale search, adaptive damping, smoothing, and GPTAQ feedback |
 | **Native qweight execution** | No persistent duplicate pair-packed weight tensor |
 | **Fail-closed model support** | Architecture, layer order, precision boundaries, and packed-module counts are validated |
@@ -210,7 +211,9 @@ coding, agent, tool-use, multilingual, and long-document workload.
 3. **General fallback** — validator-backed edge-shape execution.
 
 All paths consume the checkpoint's original `int32 qweight` directly. See
-[`docs/KERNEL_V3.md`](docs/KERNEL_V3.md).
+[`docs/KERNEL_V3.md`](docs/KERNEL_V3.md). The V4 register-cached scale
+overlay is retained as a validated negative result —
+[`docs/KERNEL_V4_EXPERIMENT.md`](docs/KERNEL_V4_EXPERIMENT.md).
 
 ## Selective source-precision preservation
 
@@ -263,6 +266,7 @@ checkpoint.
 - `scripts/` — quantization, preflight, benchmark, and validation drivers;
 - `tests/` — architecture and kernel regression tests;
 - `docs/KERNEL_V3.md` — V3 dispatch and numerical contract;
+- `docs/KERNEL_V4_EXPERIMENT.md` — V4 overlay fix, bit-exact gate, and negative result;
 - `docs/QWEN38.md` — exact Qwen3.8-27B support and deployment boundary;
 - `docs/ASSESSMENT_AND_ROADMAP.md` — measured status and remaining work.
 
